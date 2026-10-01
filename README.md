@@ -16,6 +16,49 @@ Review the [safety notice](SAFETY.md) before running the project.
 
 ## Run
 
+### Install the Linux desktop app
+
+The [`desktop-v0.2.0-rc.2` release](https://github.com/ZacharyZhang-NY/deepseek-harness/releases/tag/desktop-v0.2.0-rc.2) of this fork packages DeepSeek Harness Desktop for x86_64 Linux. It is an unofficial, unsigned build without automatic updates. Run the commands for your distribution, then start **DeepSeek Harness** from the application launcher or with `deepseek-harness`.
+
+Arch Linux and Omarchy:
+
+```sh
+sudo pacman -U https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+```
+
+To build the same package from its PKGBUILD instead:
+
+```sh
+git clone -b linux https://github.com/ZacharyZhang-NY/deepseek-harness.git
+cd deepseek-harness/apps/desktop/packaging/aur
+makepkg -si
+```
+
+The package will be published to the AUR as `deepseek-harness-desktop-bin` once AUR account registration reopens.
+
+Debian and Ubuntu:
+
+```sh
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-amd64.deb
+sudo apt install ./deepseek-harness-0.2.0-rc.2-linux-amd64.deb
+```
+
+Fedora:
+
+```sh
+sudo dnf install https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-x86_64.rpm
+```
+
+Any distribution, as an AppImage (requires FUSE 2, packaged as `fuse2` on Arch and `libfuse2` on Debian and Ubuntu):
+
+```sh
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+chmod +x deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+./deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+```
+
+On Omarchy, keep Settings → General → Appearance on **System** (the default): the app then uses the active Omarchy theme's colors and light or dark mode, and follows every `omarchy-theme-set` switch. Checksums for every file are in [`SHA256SUMS`](https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/SHA256SUMS).
+
 ### Run from `npm`
 
 Install `Node.js`, then run:

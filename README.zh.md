@@ -18,6 +18,51 @@ DeepSeek Harness 处于 _开发者预览_ 阶段，正在快速迭代。**未来
 
 ## 运行
 
+<a id="install-the-linux-desktop-app"></a>
+
+### 安装 Linux 桌面应用
+
+本 fork 的 [`desktop-v0.2.0-rc.2` release](https://github.com/ZacharyZhang-NY/deepseek-harness/releases/tag/desktop-v0.2.0-rc.2) 为 x86_64 Linux 打包了 DeepSeek Harness Desktop。它是非官方、未签名的构建，不支持自动更新。运行对应发行版的命令，然后从应用启动器打开 **DeepSeek Harness**，或运行 `deepseek-harness`。
+
+Arch Linux 和 Omarchy：
+
+```sh
+sudo pacman -U https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+```
+
+如需改为从 PKGBUILD 构建同一个包：
+
+```sh
+git clone -b linux https://github.com/ZacharyZhang-NY/deepseek-harness.git
+cd deepseek-harness/apps/desktop/packaging/aur
+makepkg -si
+```
+
+AUR 重新开放账户注册后，该包将以 `deepseek-harness-desktop-bin` 发布到 AUR。
+
+Debian 和 Ubuntu：
+
+```sh
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-amd64.deb
+sudo apt install ./deepseek-harness-0.2.0-rc.2-linux-amd64.deb
+```
+
+Fedora：
+
+```sh
+sudo dnf install https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-x86_64.rpm
+```
+
+任意发行版，使用 AppImage（需要 FUSE 2，Arch 上为 `fuse2`，Debian 和 Ubuntu 上为 `libfuse2`）：
+
+```sh
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+chmod +x deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+./deepseek-harness-0.2.0-rc.2-linux-x86_64.AppImage
+```
+
+在 Omarchy 上，请将 设置 → 通用 → 外观 保持为 **跟随系统**（默认值）：应用会使用当前 Omarchy 主题的颜色和浅色/深色模式，并跟随每次 `omarchy-theme-set` 切换。所有文件的校验和见 [`SHA256SUMS`](https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/SHA256SUMS)。
+
 ### 通过 `npm` 运行
 
 安装 `Node.js`，然后运行：
