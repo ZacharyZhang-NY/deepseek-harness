@@ -27,10 +27,11 @@ DeepSeek Harness 处于 _开发者预览_ 阶段，正在快速迭代。**未来
 Arch Linux 和 Omarchy：
 
 ```sh
-sudo pacman -U https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+sudo pacman -U ./deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
 ```
 
-如需改为从 PKGBUILD 构建同一个包：
+该包未签名，因此请先下载再安装：直接对 URL 运行 `pacman -U` 需要签名文件。如需改为从 PKGBUILD 构建同一个包：
 
 ```sh
 git clone -b linux https://github.com/ZacharyZhang-NY/deepseek-harness.git

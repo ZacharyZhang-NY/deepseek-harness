@@ -23,10 +23,11 @@ The [`desktop-v0.2.0-rc.2` release](https://github.com/ZacharyZhang-NY/deepseek-
 Arch Linux and Omarchy:
 
 ```sh
-sudo pacman -U https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v0.2.0-rc.2/deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
+sudo pacman -U ./deepseek-harness-desktop-bin-0.2.0rc.2-1-x86_64.pkg.tar.zst
 ```
 
-To build the same package from its PKGBUILD instead:
+The package is unsigned, so download it before installing: `pacman -U` with a URL requires a signature file. To build the same package from its PKGBUILD instead:
 
 ```sh
 git clone -b linux https://github.com/ZacharyZhang-NY/deepseek-harness.git
