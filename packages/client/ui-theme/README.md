@@ -35,6 +35,10 @@ The plugin registers Appearance preference cubes and a font-size stepper in the 
 
 A composition can register a third-party theme id with alias-token overrides through `ctx.theme`; the override layer folds into the active snapshot's tokens in registration order. Removing one never overwrites the last durable built-in preference. Third-party theme ids remain an in-process extension and do not cross the built-in settings schema.
 
+### Desktop system palette
+
+When the Desktop shell publishes `dshDesktop.systemPalette`, the `system` preference resolves to that palette instead of the built-in palette matching `prefers-color-scheme`. Desktop publishes the active Omarchy theme on Linux and follows each theme switch; other platforms and browsers publish nothing, so `system` behaves as before. The plugin validates each payload, maps its role colors (background, recessed and raised surfaces, text levels, accent, and state colors) onto the alias and specific tokens through `ThemeRuntime.setSystemTheme`, and builds on the palette's own light or dark base. Choosing Light or Dark keeps the built-in palettes; override layers still fold over the desktop palette.
+
 ### Pre-plugin palette
 
 When the host composition includes an HTTP server, the host half embeds the registered `ui-theme` settings, or schema defaults, into each index response. Head CSS selects the document canvas color scheme before any script runs, including a `prefers-color-scheme` query for the `system` preference. A body script then sets `body[data-ds-dark-theme]` and `--dsh-content-font-size` before the loading page and application scripts, so the first paint uses the selected palette and text size.

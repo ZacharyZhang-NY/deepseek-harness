@@ -28,6 +28,8 @@ export const DESKTOP_IPC = {
   updatesOpen: 'dsh-desktop:updates-open',
   updatesPresentation: 'dsh-desktop:updates-presentation',
   nativeThemeSet: 'dsh-desktop:native-theme-set',
+  systemPalette: 'dsh-desktop:system-palette',
+  systemPaletteChanged: 'dsh-desktop:system-palette-changed',
   windowFullscreen: 'dsh-desktop:window-fullscreen',
   windowsAppearance: 'dsh-desktop:windows-appearance',
   windowsMenu: 'dsh-desktop:windows-menu',
@@ -69,6 +71,33 @@ export interface DesktopUpdatePresentation {
 }
 
 /** Product documents cannot supply update versions, package URLs, or installation authorization. */
+/** Role colors of the desktop theme, each a lowercase `#rrggbb` value; ui-theme maps them onto its tokens. */
+export interface DesktopSystemPaletteColors {
+  readonly accent: string
+  readonly selection: string
+  readonly muted: string
+  readonly background: string
+  readonly darkBackground: string
+  readonly darkerBackground: string
+  readonly lighterBackground: string
+  readonly foreground: string
+  readonly darkForeground: string
+  readonly lightForeground: string
+  readonly brightForeground: string
+  readonly red: string
+  readonly green: string
+  readonly warning: string
+}
+
+/** Active desktop theme that the `system` appearance preference follows (Omarchy on Linux). */
+export interface DesktopSystemPalette {
+  readonly source: 'omarchy'
+  /** Theme name reported by the desktop. */
+  readonly name: string
+  readonly colorScheme: 'light' | 'dark'
+  readonly colors: DesktopSystemPaletteColors
+}
+
 export interface DshDesktopProductApi {
   readonly protocolVersion: 1
   readonly browser: DesktopBrowserBridge
@@ -79,6 +108,11 @@ export interface DshDesktopProductApi {
    * @returns `name=value` fields separated by `; `, with no hostname, user name, or serial number.
    */
   deviceInfo(): Promise<string>
+  /** Desktop theme palette; `null` outside Omarchy or while no theme is active. */
+  readonly systemPalette: {
+    current(): Promise<DesktopSystemPalette | null>
+    subscribe(listener: (palette: DesktopSystemPalette | null) => void): () => void
+  }
   readonly updates: {
     status(): Promise<DesktopUpdatePresentation>
     open(): Promise<void>

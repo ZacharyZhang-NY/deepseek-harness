@@ -35,6 +35,10 @@ kind: "package-reference"
 
 组合可以通过 `ctx.theme` 注册带别名 token 覆盖的第三方主题 id；覆盖层按注册顺序折入活动快照的 token 中。移除其中一个绝不会覆盖最后一个持久化的内置偏好。第三方主题 id 仍是进程内扩展，不会跨越内置 settings schema。
 
+### 桌面系统调色板
+
+Desktop 外壳发布 `dshDesktop.systemPalette` 时，`system` 偏好解析为该调色板，而不是与 `prefers-color-scheme` 匹配的内置调色板。Desktop 在 Linux 上发布当前 Omarchy 主题，并跟随每次主题切换；其他平台和浏览器不发布调色板，因此 `system` 行为保持不变。插件校验每份载荷，通过 `ThemeRuntime.setSystemTheme` 将其角色颜色（背景、下沉与凸起表面、各级文字、强调色和状态色）映射到 alias 与 specific token，并以调色板自身的浅色或深色基底为基础。选择浅色或深色时仍使用内置调色板；覆盖层仍折入桌面调色板之上。
+
 ### 插件前调色板
 
 当主机组合包含 HTTP 服务器时，宿主侧会把已注册的 `ui-theme` 设置或 schema 默认值嵌入每份 index 响应。head CSS 会在任何脚本运行前选择文档画布的配色方案，其中 `system` 偏好使用 `prefers-color-scheme` 查询；随后，body 脚本会在加载页面和应用脚本之前设置 `body[data-ds-dark-theme]` 与 `--dsh-content-font-size`，因此首帧绘制就采用所选调色板与字号。

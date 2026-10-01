@@ -21,6 +21,7 @@ import { AppearanceRow } from './AppearanceRow.tsx'
 import type { FontSizeRowInjected } from './FontSizeRow.tsx'
 import { FontSizeRow } from './FontSizeRow.tsx'
 import { createAppearanceRowStore, createFontSizeRowStore } from './settings-store.ts'
+import { parseSystemPalette, SYSTEM_PALETTE_THEME_ID, systemPaletteTokens, type SystemPaletteBridge } from './system-palette.ts'
 import { installThemeStyles } from './styles.ts'
 import { en, zh, type ThemeKey } from './locales.ts'
 import {
@@ -33,6 +34,7 @@ export type { AppearanceRowComponentProps, AppearanceRowInjected } from './Appea
 export type { FontSizeRowComponentProps, FontSizeRowInjected } from './FontSizeRow.tsx'
 export type { AppearanceRowState, FontSizeRowState } from './settings-store.ts'
 export type { ThemeKey } from './locales.ts'
+export type { SystemPalette, SystemPaletteBridge, SystemPaletteColors } from './system-palette.ts'
 export type { ThemePreference, ThemeSettings } from '../theme-settings.ts'
 
 /** Namespace owning this feature's settings-row copy. */
@@ -168,6 +170,8 @@ export class ThemeRuntime {
   /** Override layers by source; seq (monotonic) is the stacking order. */
   private readonly overrides = new Map<string, { seq: number; tokens: ThemeTokenOverrides }>()
   private overrideSeq = 0
+  /** Host desktop theme that `system` resolves to; undefined resolves through prefers-color-scheme. */
+  private systemTheme: ThemeDefinition | undefined
 
   /**
    * @param ctx - owning context (change events are emitted on it; the
@@ -317,13 +321,29 @@ export class ThemeRuntime {
     }
   }
 
+  /**
+   * Make the `system` preference resolve to the host desktop's theme (the
+   * Omarchy palette in Desktop on Linux) instead of the built-in palette
+   * matching `prefers-color-scheme`. Fixed preferences are unaffected, and
+   * the definition stays out of the registry and the settings schema.
+   * Emits `theme/change`.
+   * @param definition - desktop theme, or `undefined` to follow `prefers-color-scheme` again.
+   */
+  setSystemTheme(definition: ThemeDefinition | undefined): void {
+    if (this.systemTheme === definition) return
+    this.systemTheme = definition
+    this.publish()
+  }
+
   private buildSnapshot(): ThemeSnapshot {
     const resolvedId = this.preference === 'system'
       ? (this.media?.matches === true ? 'dark' : 'light')
       : this.preference
     // Both built-ins always exist; a registered preference id resolves or has
     // been reset by its disposer, so the lookup cannot miss.
-    const active = this.themes.find(t => t.id === resolvedId)
+    const active = this.preference === 'system' && this.systemTheme !== undefined
+      ? this.systemTheme
+      : this.themes.find(t => t.id === resolvedId)
     /* v8 ignore next 2 -- needs a registry without light/dark, which register()/dispose() cannot produce */
     if (active === undefined) throw new Error(`theme registry lost "${resolvedId}"`)
     return Object.freeze({
@@ -414,6 +434,35 @@ function dynamicToken(name: string): ThemeTokenInspection {
 }
 
 /**
+ * Resolve the `system` preference to the palette the Desktop shell publishes
+ * as `dshDesktop.systemPalette` (Omarchy on Linux). Browsers and other
+ * desktops have no bridge or publish `null`, so `system` keeps following
+ * `prefers-color-scheme`.
+ * @param ctx - owning context; the bridge subscription ends with it.
+ * @param theme - runtime whose system theme follows the bridge.
+ */
+function followSystemPalette(ctx: ClientContext, theme: ThemeRuntime): void {
+  type DesktopCarrier = { dshDesktop?: { protocolVersion: number; systemPalette?: SystemPaletteBridge } }
+  const carrier = (globalThis as typeof globalThis & DesktopCarrier).dshDesktop
+  const bridge = carrier?.protocolVersion === 1 ? carrier.systemPalette : undefined
+  if (bridge === undefined) return
+  let pushed = false
+  let active = true
+  const adopt = (value: unknown): void => {
+    if (!active) return
+    const palette = parseSystemPalette(value)
+    theme.setSystemTheme(palette === undefined ? undefined
+      : { id: SYSTEM_PALETTE_THEME_ID, colorScheme: palette.colorScheme, tokens: systemPaletteTokens(palette) })
+  }
+  ctx.effect(() => {
+    const unsubscribe = bridge.subscribe((value) => { pushed = true; adopt(value) })
+    return () => { active = false; unsubscribe() }
+  }, 'ui-theme: desktop system palette')
+  // A change pushed while the initial read is in flight is newer than its answer.
+  void bridge.current().then((value) => { if (!pushed) adopt(value) }, (error: unknown) => { console.error(error) })
+}
+
+/**
  * Required services: settings transport plus slots/locale for the Appearance
  * row. `remote` carries the forwarded settings invalidation that
  * `ctx.configForms.get(entryId)` subscribes to on this context.
@@ -433,6 +482,7 @@ export function apply(ctx: ClientContext): void {
   ctx.provide('theme', theme)
 
   ctx.effect(() => ctx.locale.register(SETTINGS_NS, { zh, en }), 'ui-theme: settings row dictionaries')
+  followSystemPalette(ctx, theme)
 
   const store = createAppearanceRowStore()
   let bound: BoundActions<typeof store> | undefined

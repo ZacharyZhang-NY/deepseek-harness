@@ -1,8 +1,8 @@
-/** Origin-scoped boot, native directory selection, host paths of picked files, and update presentation with native confirmation actions. */
+/** Origin-scoped boot, directory picking, picked-file paths, desktop theme palette, and update presentation with native confirmations. */
 
 import type { DesktopShortcutInput, ShortcutConfigSnapshot, ShortcutSaveResult } from '@deepseek-ai/dsh-client-shortcuts/protocol'
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { DESKTOP_IPC, SCHEME, type DshDesktopProductApi, type DesktopUpdatePresentation } from './ipc.ts'
+import { DESKTOP_IPC, SCHEME, type DshDesktopProductApi, type DesktopSystemPalette, type DesktopUpdatePresentation } from './ipc.ts'
 import { PLATFORM_IPC } from './platform-ipc.ts'
 import { markDocumentPlatform, syncWindowFullscreen } from './preload-platform.ts'
 import { syncNativeTheme } from './preload-theme.ts'
@@ -44,6 +44,14 @@ function createProductApi(): DshDesktopProductApi {
         const handle = (_event: Electron.IpcRendererEvent, snapshot: ShortcutConfigSnapshot): void => { listener(snapshot) }
         ipcRenderer.on(DESKTOP_IPC.shortcutsChanged, handle)
         return () => { ipcRenderer.off(DESKTOP_IPC.shortcutsChanged, handle) }
+      },
+    },
+    systemPalette: {
+      current: () => ipcRenderer.invoke(DESKTOP_IPC.systemPalette) as Promise<DesktopSystemPalette | null>,
+      subscribe(listener) {
+        const handle = (_event: Electron.IpcRendererEvent, palette: DesktopSystemPalette | null): void => { listener(palette) }
+        ipcRenderer.on(DESKTOP_IPC.systemPaletteChanged, handle)
+        return () => { ipcRenderer.off(DESKTOP_IPC.systemPaletteChanged, handle) }
       },
     },
     updates: {

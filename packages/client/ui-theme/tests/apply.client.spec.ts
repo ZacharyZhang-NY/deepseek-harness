@@ -250,3 +250,46 @@ describe('ui-theme apply', () => {
     expect(quiet.slots.entries(SLOT)).toHaveLength(0)
   })
 })
+
+describe('ui-theme desktop system palette', () => {
+  const palette = {
+    source: 'omarchy', name: 'tokyo-night', colorScheme: 'dark',
+    colors: {
+      accent: '#7aa2f7', selection: '#292e42', muted: '#414868',
+      background: '#1a1b26', darkBackground: '#13141c', darkerBackground: '#0e0e14', lighterBackground: '#24283b',
+      foreground: '#a9b1d6', darkForeground: '#565f89', lightForeground: '#b4bee6', brightForeground: '#c0caf5',
+      red: '#f7768e', green: '#9ece6a', warning: '#ff9e64',
+    },
+  }
+
+  it('follows palettes the Desktop bridge pushes, ignores a superseded initial answer, and unsubscribes on dispose', async () => {
+    let push: ((value: unknown) => void) | undefined
+    const answer = deferred<unknown>()
+    const unsubscribe = vi.fn()
+    const carrier = globalThis as typeof globalThis & { dshDesktop?: unknown }
+    carrier.dshDesktop = {
+      protocolVersion: 1,
+      systemPalette: {
+        current: () => answer.promise,
+        subscribe: (listener: (value: unknown) => void) => { push = listener; return unsubscribe },
+      },
+    }
+    try {
+      const { ctx } = await bench()
+      const fiber = ctx.plugin({ inject: [...inject], apply })
+      await fiber.await()
+      const theme = ctx.get('theme') as ThemeRuntime
+      push?.(palette)
+      answer.resolve(null)
+      await answer.promise
+      expect(theme.getTheme().active).toMatchObject({ id: 'desktop-system-palette', colorScheme: 'dark' })
+      expect(theme.getTheme().active.tokens['--dsw-alias-bg-base']).toBe('#1a1b26')
+      push?.({ ...palette, colors: { ...palette.colors, background: 'url(x)' } })
+      expect(theme.getTheme().active.id).toBe('light')
+      await fiber.dispose()
+      expect(unsubscribe).toHaveBeenCalledOnce()
+    } finally {
+      delete carrier.dshDesktop
+    }
+  })
+})

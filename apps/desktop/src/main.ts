@@ -59,6 +59,7 @@ import { DesktopUpdateOverlays } from './update-overlay.ts'
 import { DesktopQuitConfirmation } from './quit-confirmation.ts'
 import { DesktopTray } from './tray.ts'
 import { DesktopBackgroundNotice } from './background-notice.ts'
+import { defaultOmarchyThemeDirectory, OmarchyThemeSource } from './omarchy-theme.ts'
 
 let focusPrimaryWindow = (): void => {}
 let stopForRecovery = async (): Promise<void> => {}
@@ -420,6 +421,23 @@ async function main(): Promise<void> {
   let returnedAttempt: string | undefined
   let pendingWelcomeNotice: WelcomeNotice | undefined
   let previousAccountStatus: string | undefined
+  // The renderer's theme preference; `system` follows the Omarchy theme's scheme when one is active.
+  let requestedThemeSource: 'light' | 'dark' | 'system' = 'system'
+  let systemPalette: OmarchyThemeSource | undefined
+  const applyNativeThemeSource = (): void => {
+    const palette = systemPalette?.current
+    nativeTheme.themeSource = requestedThemeSource === 'system' && palette !== undefined ? palette.colorScheme : requestedThemeSource
+  }
+  if (process.platform === 'linux') {
+    systemPalette = new OmarchyThemeSource(defaultOmarchyThemeDirectory(), (palette) => {
+      applyNativeThemeSource()
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send(DESKTOP_IPC.systemPaletteChanged, palette ?? null)
+    })
+    app.on('will-quit', () => { systemPalette?.dispose() })
+    // Read before the first window so its native chrome and first paint already use the theme's scheme.
+    await systemPalette.start()
+    applyNativeThemeSource()
+  }
   const assertProductSender = (event: IpcMainInvokeEvent): void => {
     assertDesktopSender(event, ['app'])
     if (mainWindow === undefined || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
@@ -748,7 +766,13 @@ async function main(): Promise<void> {
   // Only the main window may synchronize its palette with the native material.
   ipcMain.on(DESKTOP_IPC.nativeThemeSet, (event, source: unknown) => {
     if (mainWindow === undefined || event.sender !== mainWindow.webContents) return
-    if (source === 'light' || source === 'dark' || source === 'system') nativeTheme.themeSource = source
+    if (source !== 'light' && source !== 'dark' && source !== 'system') return
+    requestedThemeSource = source
+    applyNativeThemeSource()
+  })
+  ipcMain.handle(DESKTOP_IPC.systemPalette, (event) => {
+    assertProductSender(event)
+    return systemPalette?.current ?? null
   })
   ipcMain.handle(DESKTOP_IPC.localeBootstrap, async (event) => {
     if (event.sender !== mainWindow?.webContents || event.senderFrame !== mainWindow.webContents.mainFrame
