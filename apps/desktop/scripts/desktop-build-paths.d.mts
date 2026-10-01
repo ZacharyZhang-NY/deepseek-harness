@@ -1,5 +1,8 @@
 import type { DesktopAutoUpdateTarget } from './desktop-auto-update-environment.mjs'
 
+/** Every target Desktop can be packaged for; Linux is packaged locally and never published to an update feed. */
+export type DesktopBuildTarget = DesktopAutoUpdateTarget | 'linux-x64'
+
 /** Mutable target directories plus the shared immutable download cache. */
 export interface DesktopTargetBuildPaths {
   readonly root: string
@@ -27,14 +30,14 @@ export function resolveDesktopBuildTarget(
   env?: NodeJS.ProcessEnv,
   hostPlatform?: NodeJS.Platform,
   hostArch?: string,
-): DesktopAutoUpdateTarget
+): DesktopBuildTarget
 
 /**
  * Return the mutable preparation and artifact directories owned by one release target.
  * @param target - Supported Desktop target name.
  * @returns Target paths plus the shared immutable download cache.
  */
-export function desktopTargetBuildPaths(target: DesktopAutoUpdateTarget): DesktopTargetBuildPaths
+export function desktopTargetBuildPaths(target: DesktopBuildTarget): DesktopTargetBuildPaths
 
 /**
  * Return the platform and architecture of the payload one release target prepares.
@@ -42,10 +45,29 @@ export function desktopTargetBuildPaths(target: DesktopAutoUpdateTarget): Deskto
  * @param target - Supported Desktop target name.
  * @returns Platform and architecture of the prepared payload.
  */
-export function desktopTargetPlatform(target: DesktopAutoUpdateTarget): {
-  readonly platform: 'darwin' | 'win32'
+export function desktopTargetPlatform(target: DesktopBuildTarget): {
+  readonly platform: 'darwin' | 'win32' | 'linux'
   readonly arch: 'arm64' | 'x64'
 }
+
+/**
+ * Locate the Electron executable inside an extracted Electron distribution.
+ * @param electronRoot - Directory the target's Electron archive was extracted into.
+ * @param platform - Platform the distribution was built for.
+ * @returns Absolute executable path.
+ */
+export function desktopElectronExecutable(electronRoot: string, platform: NodeJS.Platform): string
+
+/**
+ * Locate the Node executable that runs the Host, package scripts, and the terminal command.
+ * Electron's Node mode serves macOS and Windows; Linux uses the primary runtime's standalone Node
+ * because Electron exposes the system GLib to native modules there (electron/electron#46323).
+ * @param platform - Target platform.
+ * @param electronRoot - Directory the target's Electron archive was extracted into.
+ * @param runtimeRoot - Target runtime directory containing `primary-runtime/`.
+ * @returns Absolute executable path.
+ */
+export function desktopHostNodeExecutable(platform: NodeJS.Platform, electronRoot: string, runtimeRoot: string): string
 
 /**
  * Resolve the paths owned by the target selected in a packaging environment.

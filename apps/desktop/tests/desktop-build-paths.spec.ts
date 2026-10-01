@@ -1,6 +1,8 @@
 import { join, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  desktopElectronExecutable,
+  desktopHostNodeExecutable,
   desktopTargetBuildPaths,
   desktopTargetPlatform,
   developmentRuntimeDirectory,
@@ -54,7 +56,20 @@ describe('desktop build paths', () => {
     expect(desktopTargetPlatform('mac-arm64')).toEqual({ platform: 'darwin', arch: 'arm64' })
     expect(desktopTargetPlatform('mac-x64')).toEqual({ platform: 'darwin', arch: 'x64' })
     expect(desktopTargetPlatform('win-x64')).toEqual({ platform: 'win32', arch: 'x64' })
-    expect(() => desktopTargetPlatform('linux-x64' as 'mac-x64')).toThrow(/unsupported target/u)
+    expect(desktopTargetPlatform('linux-x64')).toEqual({ platform: 'linux', arch: 'x64' })
+    expect(() => desktopTargetPlatform('linux-arm64' as 'mac-x64')).toThrow(/unsupported target/u)
+  })
+
+  it('locates the Electron executable inside each platform distribution', () => {
+    expect(desktopElectronExecutable('/electron', 'win32')).toBe(join('/electron', 'electron.exe'))
+    expect(desktopElectronExecutable('/electron', 'linux')).toBe(join('/electron', 'electron'))
+    expect(desktopElectronExecutable('/electron', 'darwin')).toBe(join('/electron', 'Electron.app', 'Contents', 'MacOS', 'Electron'))
+  })
+
+  it('runs the Linux Host on the primary runtime Node and other Hosts on Electron', () => {
+    expect(desktopHostNodeExecutable('linux', '/electron', '/runtime'))
+      .toBe(join('/runtime', 'primary-runtime', 'dependencies', 'node', 'bin', 'node'))
+    expect(desktopHostNodeExecutable('win32', '/electron', '/runtime')).toBe(join('/electron', 'electron.exe'))
   })
 
   it('resolves environment overrides and rejects unsupported targets', () => {
@@ -63,7 +78,8 @@ describe('desktop build paths', () => {
       DSH_DESKTOP_TARGET_ARCH: 'x64',
     }, 'darwin', 'arm64')).toBe('mac-x64')
     expect(resolveDesktopBuildTarget({}, 'win32', 'x64')).toBe('win-x64')
-    expect(() => resolveDesktopBuildTarget({}, 'linux', 'x64')).toThrow(/unsupported target/u)
-    expect(() => desktopTargetBuildPaths('linux-x64' as 'mac-x64')).toThrow(/unsupported target/u)
+    expect(resolveDesktopBuildTarget({}, 'linux', 'x64')).toBe('linux-x64')
+    expect(() => resolveDesktopBuildTarget({}, 'linux', 'arm64')).toThrow(/unsupported target/u)
+    expect(() => desktopTargetBuildPaths('linux-arm64' as 'mac-x64')).toThrow(/unsupported target/u)
   })
 })

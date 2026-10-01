@@ -7,6 +7,7 @@ import { resolveWindowsPackageSettings } from '../scripts/windows-package-settin
 
 const WINDOWS = { platform: 'win32', arch: 'x64' } as const
 const MACOS = { platform: 'darwin', arch: 'arm64' } as const
+const LINUX = { platform: 'linux', arch: 'x64' } as const
 const POLICY = { DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN: 'https://policy.example.com',
   DSH_DESKTOP_MANDATORY_UPDATE_CONFIG: JSON.stringify({ allowedAuthOrigins: ['https://login.example.com'] }) }
 const RELEASE = { ...POLICY, DSH_DESKTOP_APP_ID: 'com.example.desktop', DOWNLOAD_TEST_ORIGIN: 'https://updates.example.com',
@@ -137,6 +138,20 @@ describe('Desktop local packaging configuration', () => {
     expect(() => {
       validateDesktopPackageEnvironment({ ...POLICY, DSH_DESKTOP_APP_ID: RELEASE.DSH_DESKTOP_APP_ID }, WINDOWS, { prepareOnly: true })
     }).not.toThrow()
+  })
+
+  it('reads Linux identity and registry from .env.linux and needs no update, policy, or signing settings', async () => {
+    await withDirectory(async (directory) => {
+      expect(() => loadDesktopPackageEnvironment('linux', RELEASE, directory)).toThrow(/copy .*\.env.linux.example/u)
+      await writeFile(join(directory, '.env.linux'), 'DSH_DESKTOP_APP_ID=com.example.desktop\nDSH_DESKTOP_NPM_REGISTRY=https://registry.npmmirror.com\n')
+      const environment = loadDesktopPackageEnvironment('linux', { DSH_DESKTOP_AUTO_UPDATE_ENV: 'production', PATH: '/usr/bin' }, directory)
+      expect(environment).toMatchObject({ DSH_DESKTOP_APP_ID: 'com.example.desktop', PATH: '/usr/bin' })
+      expect(environment.DSH_DESKTOP_AUTO_UPDATE_ENV).toBeUndefined()
+      expect(() => { validateDesktopPackageEnvironment(environment, LINUX) }).not.toThrow()
+      await writeFile(join(directory, '.env.linux'), 'DOWNLOAD_TEST_ORIGIN=https://updates.example.com\n')
+      expect(() => loadDesktopPackageEnvironment('linux', {}, directory)).toThrow(/unsupported setting DOWNLOAD_TEST_ORIGIN/u)
+    })
+    expect(() => { validateDesktopPackageEnvironment({}, LINUX) }).toThrow(/DSH_DESKTOP_APP_ID/u)
   })
 
   it('accepts one local npm registry mirror and rejects other registry forms', () => {

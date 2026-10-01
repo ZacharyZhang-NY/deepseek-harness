@@ -323,6 +323,16 @@ pnpm run package:desktop:win:x64:unsigned
 
 该命令要求设置 `DSH_DESKTOP_APP_ID` 并具备常规构建依赖，包括编译原生模块所需的 Python 和 Visual C++ 构建工具。Python 不在 `PATH` 中时，将 `PYTHON` 设置为其可执行文件路径。命令将安装包写入 `.desktop-build/targets/win-x64/unsigned-artifacts/`，省略自动更新配置，清除签名凭据，且不生成发布完成记录。它不需要 EV 凭据或更新源地址。签名打包和上传命令仍遵循正式发布要求。
 
+### Linux AppImage
+
+在 Linux x64 上，将 [Linux 模板](.env.linux.example) 复制为 `apps/desktop/.env.linux`，然后运行：
+
+```sh
+pnpm run package:desktop:linux:x64
+```
+
+该命令将四种安装包和未打包的 `linux-unpacked/` 目录写入 `.desktop-build/targets/linux-x64/artifacts/`：适用于任意发行版的 AppImage、适用于 Debian 和 Ubuntu 的 `.deb`、适用于 Fedora 的 `.rpm`，以及适用于 Arch Linux 的 `.pacman` 包（`pacman -U`）。`package:desktop:linux:x64:dir` 只生成目录。rpm 目标需要主机上的 `rpmbuild`（Arch 为 `rpm-tools`，Debian 和 Ubuntu 为 `rpm`，Fedora 为 `rpm-build`）；缺少它时，工具链检查会在构建前拒绝该主机。`.env.linux` 只接受 `DSH_DESKTOP_APP_ID`、`DSH_DESKTOP_NPM_REGISTRY` 和可选的安装包维护者 `DSH_DESKTOP_LINUX_MAINTAINER`。[`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) 基于 `desktop-v<version>` GitHub release 附带的 `.deb` 构建 `deepseek-harness-bin` AUR 包；上传 release 后，设置 `_pkgver`，运行 `updpkgsums` 和 `makepkg --printsrcinfo > .SRCINFO`，再将这两个文件推送到 AUR 仓库。Linux 产物不签名，不包含更新源和强制更新策略，也不生成发布完成记录，因此 `upload` 和 `--build-version auto` 会拒绝该目标。Linux 上的 Electron 会把系统 GLib 暴露给原生模块（[electron#46323](https://github.com/electron/electron/issues/46323)），导致 libvips 图像解码崩溃，因此 Linux 的 Host、包脚本和终端命令改用主运行时自带的独立 Node，而不是 Electron 的 Node 模式；由于该 Node 无法读取 ASAR 归档，应用以未打包形式发布。打包后的运行时通过与其他目标相同的载荷和 Host 冒烟检查。
+
 ### Windows 安装界面
 
 Windows 安装程序使用原生 NSIS 页面，提供亮暗配色、系统阴影、可编辑的安装目录，以及默认勾选立即启动的完成页。安装仅面向当前用户。点击安装或按 Enter 均校验当前路径；新安装位置必须为空，非空位置必须是已登记的安装目录。受影响安装路径中的程序运行时显示系统提示，并保持应用运行；其他目录中的同名应用不阻止安装。静默更新最多等待受影响应用退出十秒，若仍在运行则以退出码 2 结束。

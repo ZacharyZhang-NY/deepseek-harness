@@ -1,0 +1,15 @@
+#!/bin/sh
+# Run the installed CLI without changing the invoking shell or working directory.
+# Linux runs it on the primary runtime's standalone Node from the unpacked application.
+set -e
+launcher=$0
+while [ -L "$launcher" ]; do
+  directory=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
+  target=$(readlink "$launcher")
+  case "$target" in
+    /*) launcher=$target ;;
+    *) launcher=$directory/$target ;;
+  esac
+done
+resources=$(CDPATH= cd -- "$(dirname -- "$launcher")/../../.." && pwd -P)
+exec "$resources/runtime/primary-runtime/dependencies/node/bin/node" --expose-internals "$resources/app/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js" "$@"

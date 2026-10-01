@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { downloadArtifact } from '@electron/get'
 import extractZip from 'extract-zip'
-import { resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
+import { desktopHostNodeExecutable, desktopTargetPlatform, resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
 import { preparePrimaryRuntime } from './prepare-primary-runtime.ts'
 import { prepareDesktopCli } from './prepare-cli.ts'
 import { prepareCommandLink } from './prepare-command-link.ts'
@@ -31,18 +31,13 @@ function preparePnpm(): string {
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: { 'defer-primary-runtime-smoke': { type: 'boolean', default: false } } })
   const target = resolveDesktopBuildTarget()
-  const platform = target.startsWith('mac-') ? 'darwin' : 'win32'
-  const arch = target.endsWith('arm64') ? 'arm64' : 'x64'
+  const { platform, arch } = desktopTargetPlatform(target)
   const require = createRequire(import.meta.url)
   const { version } = require('electron/package.json') as { version: string }
   const archive = await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'download:electron',
     () => downloadArtifact({ version, platform, arch, artifactName: 'electron', cacheRoot: BUILD_PATHS.downloads }))
   rmSync(BUILD_PATHS.electron, { recursive: true, force: true })
   await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'extract:electron', () => extractZip(archive, { dir: BUILD_PATHS.electron }))
-  const executable = join(BUILD_PATHS.electron, platform === 'win32' ? 'electron.exe' : 'Electron.app/Contents/MacOS/Electron')
-  const nodeVersion = execFileSync(executable, ['-p', 'process.versions.node'], {
-    encoding: 'utf8', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-  }).trim()
   const macosMinimumVersion = platform === 'darwin' ? execFileSync('/usr/libexec/PlistBuddy',
     ['-c', 'Print LSMinimumSystemVersion', join(BUILD_PATHS.electron, 'Electron.app', 'Contents', 'Info.plist')], { encoding: 'utf8' }).trim() : undefined
   rmSync(RUNTIME_ROOT, { recursive: true, force: true })
@@ -50,11 +45,6 @@ async function main(): Promise<void> {
   const pnpmVersion = preparePnpm()
   cpSync(join(import.meta.dirname, 'node-bin'), join(RUNTIME_ROOT, 'bin'), { recursive: true })
   chmodSync(join(RUNTIME_ROOT, 'bin', 'node'), 0o755)
-  writeFileSync(join(RUNTIME_ROOT, 'versions.json'), `${JSON.stringify({
-    schemaVersion: 1,
-    node: nodeVersion,
-    pnpm: pnpmVersion,
-  }, undefined, 2)}\n`)
   await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'prepare:cli',
     async () => prepareDesktopCli(join(RUNTIME_ROOT, 'cli'), platform))
   if (macosMinimumVersion !== undefined) prepareCommandLink(join(RUNTIME_ROOT, 'cli'), arch, macosMinimumVersion)
@@ -62,6 +52,15 @@ async function main(): Promise<void> {
   cpSync(join(import.meta.dirname, 'command-path.ps1'), join(RUNTIME_ROOT, 'cli', 'command-path.ps1'))
   await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'prepare:primary-runtime',
     () => preparePrimaryRuntime({ deferSmoke: values['defer-primary-runtime-smoke'] }))
+  // The Host's Node exists only after the primary runtime on Linux, so its version is read last.
+  const nodeVersion = execFileSync(desktopHostNodeExecutable(platform, BUILD_PATHS.electron, RUNTIME_ROOT), ['-p', 'process.versions.node'], {
+    encoding: 'utf8', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+  }).trim()
+  writeFileSync(join(RUNTIME_ROOT, 'versions.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    node: nodeVersion,
+    pnpm: pnpmVersion,
+  }, undefined, 2)}\n`)
 }
 
 await main()

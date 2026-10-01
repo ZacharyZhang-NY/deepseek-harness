@@ -22,7 +22,7 @@ import { parse } from 'semver'
 import { desktopBuildVersionPrefix, validateDesktopBuildVersion } from './desktop-build-version.mjs'
 import { DESKTOP_AUTO_UPDATE_ENV, resolveDesktopUploadConfig } from './desktop-auto-update-environment.mjs'
 import { createDesktopCos, DESKTOP_COS_REGION } from './desktop-cos.ts'
-import type { DesktopPackageTargetName } from './package-target.ts'
+import type { DesktopPublishedTargetName } from './package-target.ts'
 
 /** How long the whole bucket listing may take before the suggestion falls back to local artifacts. */
 const LISTING_DEADLINE_MS = 8_000
@@ -36,7 +36,7 @@ const ARTIFACT = /(?:^|\/)deepseek-harness-(?<version>.+)-(?:mac|win)-(?:arm64|x
 /** Inputs that decide which versions are already taken. */
 export interface DesktopBuildVersionSuggestionOptions {
   readonly productVersion: string
-  readonly target: DesktopPackageTargetName
+  readonly target: DesktopPublishedTargetName
   readonly environment: NodeJS.ProcessEnv
   /** Date segment to number within; defaults to today where the build runs. */
   readonly date?: string

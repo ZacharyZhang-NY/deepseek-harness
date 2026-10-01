@@ -51,9 +51,11 @@ export function createElectronBuilderConfig(
   preparedRuntimeVersion = undefined,
 ) {
   const appId = resolveDesktopAppId(env)
-  const policy = resolveDesktopPolicyEnvironment(env)
   const targetPlatform = env.DSH_DESKTOP_TARGET_PLATFORM
   const resolvedPlatform = targetPlatform ?? hostPlatform
+  // Linux builds have no mandatory-update service or update feed; both stay disabled in the packaged app.
+  const packagesLinux = resolvedPlatform === 'linux'
+  const policy = packagesLinux ? undefined : resolveDesktopPolicyEnvironment(env)
   const resolvedArch = env.DSH_DESKTOP_TARGET_ARCH ?? hostArch
   if (env.DSH_DESKTOP_UNSIGNED !== undefined && !['0', '1'].includes(env.DSH_DESKTOP_UNSIGNED)) {
     throw new Error('desktop package: DSH_DESKTOP_UNSIGNED must be 0 or 1')
@@ -90,7 +92,7 @@ export function createElectronBuilderConfig(
   if (windowsSigner !== undefined) {
     installWindowsNsisBootstrapSigner({ sign: windowsSigner })
   }
-  const update = unsigned ? undefined : resolveDesktopAutoUpdateConfig(env, resolvedPlatform, resolvedArch)
+  const update = unsigned || packagesLinux ? undefined : resolveDesktopAutoUpdateConfig(env, resolvedPlatform, resolvedArch)
   if (preparedRuntime !== undefined) buildPaths.dsh = preparedRuntime
   // electron-builder merges extraMetadata into the packaged manifest, so a build version here reaches
   // the artifact names, the update feed, and the installed app.getVersion() the updater compares against.
@@ -105,12 +107,15 @@ export function createElectronBuilderConfig(
       dshMandatoryUpdatePolicy: policy,
       ...buildVersion === productVersion ? {} : { version: buildVersion },
       ...packaged === undefined ? {} : { dshBuildCommit: packaged.commit, dshBuildDirty: packaged.dirty },
+      // deb, rpm, and pacman metadata require a homepage; desktopName becomes the Wayland app_id and X11 WM_CLASS.
+      ...packagesLinux ? { homepage: 'https://github.com/deepseek-ai/deepseek-harness', desktopName: 'deepseek-harness.desktop' } : {},
     },
     productName: 'DeepSeek Harness',
     // Unsigned builds carry their own suffix so a shared file can never pass for a release artifact.
     artifactName: `deepseek-harness-\${version}-\${os}-\${arch}${unsigned ? '-unsigned' : ''}.\${ext}`,
     directories: { output: unsigned ? buildPaths.unsignedArtifacts : buildPaths.artifacts },
-    asar: true,
+    // Linux runs the Host on a standalone Node, which cannot read modules inside an ASAR archive.
+    asar: !packagesLinux,
     electronDist: buildPaths.electron,
     electronFuses: { runAsNode: true },
     beforeBuild: async () => {
@@ -231,9 +236,21 @@ export function createElectronBuilderConfig(
       target: ['nsis'],
     },
     linux: {
+      icon: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)),
+      executableName: 'deepseek-harness',
       category: 'Development',
-      target: ['AppImage'],
+      synopsis: 'Desktop shell for the DeepSeek Harness agent runtime',
+      syncDesktopName: true,
+      maintainer: env.DSH_DESKTOP_LINUX_MAINTAINER?.trim() || 'DeepSeek Harness contributors',
+      vendor: 'DeepSeek Harness',
+      // AppImage for any distribution, deb for Debian/Ubuntu, rpm for Fedora, pacman for Arch and the AUR package.
+      target: ['AppImage', 'deb', 'rpm', 'pacman'],
     },
+    deb: { packageName: 'deepseek-harness' },
+    rpm: { packageName: 'deepseek-harness' },
+    // electron-builder's default pacman list targets a system Electron and names packages Arch no longer ships.
+    pacman: { packageName: 'deepseek-harness', depends: ['gtk3', 'nss', 'alsa-lib', 'libxss', 'libxtst', 'libnotify', 'libsecret',
+      'xdg-utils', 'at-spi2-core', 'util-linux-libs'] },
     nsis: {
       installerSidebar: join(buildPaths.root, 'installer-ui', 'uninstaller-sidebar.bmp'),
       uninstallerSidebar: join(buildPaths.root, 'installer-ui', 'uninstaller-sidebar.bmp'),

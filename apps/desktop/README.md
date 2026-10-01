@@ -321,6 +321,16 @@ pnpm run package:desktop:win:x64:unsigned
 
 The command requires `DSH_DESKTOP_APP_ID` and the normal build dependencies, including Python and Visual C++ build tools for native modules. Set `PYTHON` to the Python executable when it is absent from `PATH`. It writes the installer to `.desktop-build/targets/win-x64/unsigned-artifacts/`, omits automatic-update configuration, strips signing credentials, and creates no release completion record. It does not require EV credentials or an update origin. The signed packaging and upload commands retain their release requirements.
 
+### Linux AppImage
+
+On Linux x64, copy the [Linux template](.env.linux.example) to `apps/desktop/.env.linux` and run:
+
+```sh
+pnpm run package:desktop:linux:x64
+```
+
+The command writes four packages and the unpacked `linux-unpacked/` directory to `.desktop-build/targets/linux-x64/artifacts/`: an AppImage for any distribution, a `.deb` for Debian and Ubuntu, an `.rpm` for Fedora, and a `.pacman` package for Arch Linux (`pacman -U`). `package:desktop:linux:x64:dir` stops at the directory. The rpm target needs the host's `rpmbuild` (`rpm-tools` on Arch, `rpm` on Debian and Ubuntu, `rpm-build` on Fedora); the toolchain check rejects a host without it before building. `.env.linux` accepts only `DSH_DESKTOP_APP_ID`, `DSH_DESKTOP_NPM_REGISTRY`, and the optional package `DSH_DESKTOP_LINUX_MAINTAINER`. [`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) builds the `deepseek-harness-bin` AUR package from the `.deb` attached to a `desktop-v<version>` GitHub release; after uploading the release, set `_pkgver`, run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO`, and push both files to the AUR repository. Linux artifacts are unsigned, carry no update feed or mandatory-update policy, and create no release completion record, so `upload` and `--build-version auto` reject the target. Electron on Linux exposes the system GLib to native modules ([electron#46323](https://github.com/electron/electron/issues/46323)), which crashes libvips image decoding, so the Linux Host, package scripts, and terminal command run on the primary runtime's standalone Node instead of Electron's Node mode, and the application ships unpacked because that Node cannot read ASAR archives. The packaged runtime passes the same payload and Host smoke checks as the other targets.
+
 ### Windows installer interface
 
 The Windows installer uses native NSIS pages with light and dark palettes, system shadows, an editable installation directory, and a finish page whose launch checkbox is selected by default. Installation is restricted to the current user. Clicking Install or pressing Enter validates the current path; new destinations must be empty, and nonempty destinations must be registered installations. Running executables at the affected installation path produce a native prompt and remain running; same-named applications in other directories do not block installation. Silent updates wait up to ten seconds for the affected application to exit, then stop with exit code 2 if it is still running.
