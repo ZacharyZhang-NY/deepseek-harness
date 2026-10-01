@@ -1,7 +1,7 @@
 # Maintainer: ZacharyZhang-NY <ZacharyZhang-NY@users.noreply.github.com>
 # Repackages the Desktop .deb built by `pnpm run package:desktop:linux:x64`.
 
-pkgname=deepseek-harness-bin
+pkgname=deepseek-harness-desktop-bin
 _pkgver=0.2.0-rc.2
 pkgver=${_pkgver//-/}
 pkgrel=1
@@ -10,8 +10,8 @@ arch=('x86_64')
 url='https://github.com/deepseek-ai/deepseek-harness'
 license=('MIT')
 depends=('gtk3' 'nss' 'alsa-lib' 'libxss' 'libxtst' 'libnotify' 'libsecret' 'xdg-utils' 'at-spi2-core' 'util-linux-libs')
-provides=('deepseek-harness')
-conflicts=('deepseek-harness')
+provides=('deepseek-harness-desktop')
+conflicts=('deepseek-harness-desktop')
 options=('!strip' '!debug')
 _deb="deepseek-harness-${_pkgver}-linux-amd64.deb"
 source=("${_deb}::https://github.com/ZacharyZhang-NY/deepseek-harness/releases/download/desktop-v${_pkgver}/${_deb}")
