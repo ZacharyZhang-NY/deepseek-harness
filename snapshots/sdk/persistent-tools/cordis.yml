@@ -84,10 +84,6 @@
   name: '@deepseek-ai/dsh-tool-subagent-control'
   disabled: true
 
-- id: tool-subagent-list-agents
-  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-  disabled: true
-
 - id: tool-subagent
   name: '@deepseek-ai/dsh-tool-subagent'
   disabled: true
@@ -106,10 +102,6 @@
 
 - id: tool-goal
   name: '@deepseek-ai/dsh-tool-goal'
-  disabled: true
-
-- id: tool-ralph
-  name: '@deepseek-ai/dsh-tool-ralph'
   disabled: true
 
 - id: tool-web

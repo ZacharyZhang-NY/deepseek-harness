@@ -6,6 +6,7 @@ import type { Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { clientBuildEnvironmentDefines } from '../../scripts/client-build-environment.ts'
 import { productWebBundleIsolation } from './product-isolation.ts'
+import { katexWoff2Fonts } from './katex-fonts.ts'
 
 const src = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url))
 const STANDALONE_ERROR = 'apps/web is not a standalone application: bare Vite cannot inject window.__DSH_BOOT__. '
@@ -149,7 +150,7 @@ const BOOT_GRAMMAR_FILES: readonly string[] = [
   'dist/json.mjs',
 ]
 
-/** Font asset extensions routed to assets/fonts/ (KaTeX's woff2/woff/ttf faces). */
+/** Font asset extensions routed to assets/fonts/. */
 const FONT_EXTENSIONS: readonly string[] = ['.woff2', '.woff', '.ttf']
 
 /**
@@ -170,7 +171,7 @@ export default defineConfig({
   // directory, and the served index resolves identically from the site root.
   base: './',
   plugins: [
-    rejectStandaloneServe(), clientDocumentTitle(), brandFontLicense(), react(), emitPreviewPage(),
+    rejectStandaloneServe(), clientDocumentTitle(), brandFontLicense(), katexWoff2Fonts(), react(), emitPreviewPage(),
     productWebBundleIsolation(src('../..'), src('.')),
   ],
   build: {
@@ -241,8 +242,11 @@ export default defineConfig({
     // through its own package.json exports from the importer's directory, and
     // CSS still rides Vite's pipeline because the client build preset emits it
     // beside the bundle. Plugin packages never enter this graph; they arrive as
-    // runtime bundles through the client module system. The remaining alias
-    // browserizes the vendored Cordis Loader's only Node import.
+    // runtime bundles through the client module system. The node:module alias
+    // supports Loader initialization; its filesystem resolver's other Node
+    // imports must stay default imports for Vite's browser-external stubs.
+    // Browser boot supplies loader.internal before importing plugin entries,
+    // so the filesystem resolver is never invoked in the browser.
     alias: [
       { find: /^node:module$/, replacement: src('./src/node-module-stub.ts') },
     ],

@@ -9,7 +9,7 @@ kind: "package-group"
 
 ## 概述
 
-extensions 组为 agent 提供只读运行时 API 发现、供程序和浏览器消费者使用的进程内 runner，以及历史生成插件卡片。Creator 模式通过 [Plugin Manager](../boot/plugin-manager/README.zh.md) 安装持久化插件。按需选择检查、Host 执行、Client 执行或浏览器控件子包。
+extensions 组为 agent 提供只读运行时 API 发现、供程序和浏览器消费者使用的进程内 runner，以及历史生成插件卡片。标准模式和 Creator 模式通过 [Plugin Manager](../boot/plugin-manager/README.zh.md) 安装持久化插件。按需选择检查、Host 执行、Client 执行或浏览器控件子包。
 
 ## 目录
 
@@ -37,7 +37,7 @@ extensions 组为 agent 提供只读运行时 API 发现、供程序和浏览器
 - [extensions 子系统](../../docs/subsystems/extensions.zh.md)——生成的 `ctx.cordisInspect` 与 `ctx.dynamicCordisRunner` 服务 API。
 - [生成的工具目录](../../docs/tool-catalog.zh.md#deepseek-aidsh-tool-cordis)——两个只读工具 schema。
 - [生成的配置目录](../../docs/config-catalog.zh.md#deepseek-aidsh-cordis-host-runner)——runner 的受支持配置字段。
-- [自引用 Cordis 工具集 Agent Note](../../.agents/notes/implemented/feature/2026-07-08-self-referential-cordis-toolset.zh.md)——沙箱语义、生命周期与组合的设计居所。
+- [自引用 Cordis 工具集 参考](cordis-host-runner/README.zh.md)——沙箱语义、生命周期与组合的设计居所。
 - [客户端外壳与动态包 Agent Note](../../.agents/notes/implemented/architecture/2026-08-15-client-shells-and-dynamic-packages.zh.md)——浏览器半的包归属与构建面。
 
 -----

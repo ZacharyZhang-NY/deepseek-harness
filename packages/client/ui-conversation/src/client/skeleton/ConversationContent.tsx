@@ -130,6 +130,7 @@ export function ConversationContent(props: ConversationContentProps) {
         onClose: () => { setPickerOpen(false) },
       })}
       {renderSlot('conversation.hero.agentPreset', {})}
+      {sessionId === undefined ? null : <div className={css.heroOptions}>{renderSlot('conversation.hero.options', {})}</div>}
     </div>
   )
 
@@ -194,10 +195,15 @@ export function ConversationContent(props: ConversationContentProps) {
       data-conversation-region="chat"
       data-content-phase={phase}
     >
-      <div className={css.scrollBody} data-conversation-scroll="">
-        {sessionId === undefined ? null : <Views />}
-        {composerSeat}
-      </div>
+      {/* The frame wraps the scroll body in every phase, so leaving the home keeps the composer mounted. */}
+      {renderSlot('conversation.hero.frame', { hero: hero && props.variant !== 'embedded' }, {
+        children: (
+          <div className={css.scrollBody} data-conversation-scroll="">
+            {sessionId === undefined ? null : <Views />}
+            {composerSeat}
+          </div>
+        ),
+      })}
       <WidthControls container={body} phase={phase} />
     </div>
   )

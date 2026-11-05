@@ -14,7 +14,7 @@ Status: implemented
 
 表单写入当前 profile。home patch 和命令行 overlay 仍是优先级更高的部署输入；如果它们会遮蔽某次修改，编辑器会在持久化前拒绝写入。两个插件实例通过各自不同的 profile entry id 寻址。嵌套 Include 保留独立所有权，不能通过该 profile 表单写入。
 
-Cordis config patch 替换完整 entry config。编辑会保留普通字段、未编辑的秘密值和原始配置表达式。字段重置恢复当前继承值；整个 entry 重置后会移除其 config override，从而继承后续 bundle 变化。其他编辑会把该 entry 的完整 config 存入 profile 行：写入时组合出的普通字段加上全部 volatile 字段。此后 bundle 对这些字段的修改在该 entry 的 config override 被移除之前不会到达该 profile。在已发布的 bundle 中，修改默认权限预设会钉住 `permission.presets`，选择预设会钉住 `agent-presets`，编辑并行度会钉住 `agent-loop.agents`，编辑网页搜索会钉住 `web-search-deepseek.apiKeyEnv`；客户端会把这类行的每个 volatile 字段都标为已覆盖，而不只是被编辑的那个。要把写入收窄到被编辑字段需要 patch `config` 的合并语义，Include 不提供。
+Cordis config patch 替换完整 entry config。编辑会保留普通字段、未编辑的秘密值和原始配置表达式。字段重置恢复当前继承值；整个 entry 重置后会移除其 config override，从而继承后续 bundle 变化。其他编辑会把该 entry 的完整 config 存入 profile 行：写入时组合出的普通字段加上全部 volatile 字段。此后 bundle 对这些字段的修改在该 entry 的 config override 被移除之前不会到达该 profile。在已发布的 bundle 中，修改默认权限预设会钉住 `permission.presets`，选择预设会钉住 `agent-presets`，编辑并行度会钉住 `agent-loop.agents`，在「网页搜索与获取」页编辑旧版 Messages 搜索会钉住 `web-search-deepseek.apiKeyEnv`；客户端会把这类行的每个 volatile 字段都标为已覆盖，而不只是被编辑的那个。要把写入收窄到被编辑字段需要 patch `config` 的合并语义，Include 不提供。
 
 被移除的 `$DSH_HOME/settings.yaml` 会在 Settings 启动后、Loader 完成所有条目加载时一次性导入当前 profile：section id 即 entry id，其中 `ui-developer-tools` → `ui-settings`、`ui-onboarding` → `ui-settings-general`、`shell` → 当前平台的 shell 执行器条目。文件在第一次写入前改名为 `settings.yaml.imported`，因此导入不会重复；被拒绝的 section 会记录日志并保留在改名后的文件中。
 
@@ -24,6 +24,6 @@ Cordis config patch 替换完整 entry config。编辑会保留普通字段、�
 
 ## 后果
 
-本决定只替代 [配置来源所有权](2026-08-04-configuration-source-ownership.zh.md) 中的非秘密 settings 层；其中的环境限制和凭据优先级仍适用。[Volatile 引用](2026-09-18-volatile-config-references.zh.md) 负责引用生命周期和普通更新行为。
+本决定只替代 [配置来源所有权](2026-08-04-configuration-source-ownership.zh.md) 中的非秘密 settings 层；其中的环境限制仍适用，其凭据优先级已由[存储凭据优先级](2026-10-09-stored-credential-precedence.zh.md)替代。[Volatile 引用](2026-09-18-volatile-config-references.zh.md) 负责引用生命周期和普通更新行为。
 
 真实 profile 测试覆盖多实例、持久化重启、非法编辑、过期修订、高优先级层拒绝、秘密脱敏及配置表达式。浏览器测试通过完整应用执行表单写入和重置，并检查实时编辑前后的运行时引用身份。

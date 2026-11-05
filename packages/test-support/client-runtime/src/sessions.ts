@@ -1,6 +1,6 @@
 /** Test-owned Session Controller faces over declarative fixtures. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { AttachmentIdType } from '@deepseek-ai/dsh-attachment'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import {
   createScope, MutableSessionEventSource, scopeOf, SESSION_SEARCH_RESULT_LIMIT,
 } from '@deepseek-ai/dsh-api-session-controller/client'
@@ -123,10 +123,10 @@ export class FixtureSession implements SessionFace {
 
   /**
    * Fail-loud stub; supply `readAttachment` on the fixture's session face to exercise it.
-   * @param _attachmentId - opaque durable attachment id.
+   * @param _attachment - complete durable image reference.
    * @returns never — always throws.
    */
-  readAttachment(_attachmentId: AttachmentIdType): never {
+  readAttachment(_attachment: ImageAttachmentRef): never {
     throw new Error(`test session "${this.sessionId}": readAttachment is not stubbed — supply it on the fixture's session face`)
   }
 
@@ -631,7 +631,7 @@ export class TestSessions implements ISessions {
     if (retained !== undefined) return retained
     for (const [parentSessionId, projections] of Object.entries(this.list.getSnapshot().projectionsBySession)) {
       const child = projections.values.subagentCatalog?.find(entry => entry.id === id)
-      if (child !== undefined) {
+      if (child !== undefined && child.mode !== 'external') {
         return { parentSessionId: parentSessionId as SessionId, childSessionId: id, mode: child.mode }
       }
     }

@@ -35,7 +35,7 @@ describe('webApp (the real web profile)', () => {
     const names = webApp.rows.map(row => row.name)
     expect(names).toContain('@deepseek-ai/dsh-client-ui-settings-general')
     expect(names).not.toContain('@deepseek-ai/dsh-llm') // Host only
-    expect(names).not.toContain('@deepseek-ai/dsh-client-ui-schedule')
+    expect(names).toContain('@deepseek-ai/dsh-client-ui-schedule')
     expect(names).not.toContain('@deepseek-ai/dsh-web-app') // Host runtime glue, its `/startup` row is a subpath
   })
 })
@@ -73,6 +73,31 @@ class Scratch {
 describe('bundleRoster on a scratch installation', () => {
   const scratch = new Scratch()
   afterAll(() => { rmSync(scratch.root, { recursive: true, force: true }) })
+
+  it('resolves a bundle that registers its own browser entry', () => {
+    const linked = new Scratch()
+    onTestFinished(() => { rmSync(linked.root, { recursive: true, force: true }) })
+    const bundle = join(linked.root, 'workspace', 'bundle')
+    mkdirSync(bundle, { recursive: true })
+    writeFileSync(join(bundle, 'package.json'), JSON.stringify({
+      name: '@t/self', dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } },
+    }))
+    writeFileSync(join(bundle, 'cordis.patch.yml'), "- insert:\n    - name: '@t/self'\n")
+    mkdirSync(join(linked.root, 'app', 'node_modules', '@t'), { recursive: true })
+    symlinkSync(bundle, join(linked.root, 'app', 'node_modules', '@t', 'self'), 'junction')
+    expect(linked.roster(['@t/self'])).toEqual(['@t/self'])
+  })
+
+  it('resolves an anchor bundle and its browser entry before a same-named dependency', () => {
+    const anchored = new Scratch()
+    onTestFinished(() => { rmSync(anchored.root, { recursive: true, force: true }) })
+    writeFileSync(anchored.anchor, JSON.stringify({
+      name: '@t/self', dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } },
+    }))
+    writeFileSync(join(anchored.root, 'app', 'cordis.patch.yml'), "- insert:\n    - name: '@t/self'\n")
+    anchored.bundle('@t/self', '- insert: []\n')
+    expect(anchored.roster(['@t/self'])).toEqual(['@t/self'])
+  })
 
   it('resolves a linked bundle dependency before an unrelated ancestor package', () => {
     const linked = new Scratch()

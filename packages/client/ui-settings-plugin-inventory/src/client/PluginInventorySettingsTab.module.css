@@ -139,9 +139,20 @@
   cursor: pointer;
 }
 
-.cardContent:hover,
 .card[data-open='true'] > .cardContent {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* Hover stays behind @media (hover: hover) so a tap cannot latch it; the press
+   state carries the feedback a touch client would otherwise lose. */
+.cardContent:active {
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+@media (hover: hover) {
+  .cardContent:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .cardContent:focus-visible {
@@ -300,17 +311,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* A middle dot with equal space on both sides separates the subtitle's parts. */
-.groupSub > * + *::before {
-  content: '·';
-  padding: 0 6px;
-  color: var(--dsw-alias-label-tertiary);
-}
-
-.failedCount {
-  color: var(--dsw-alias-state-error-primary);
-}
-
 /* The preset switcher trigger mirrors the General-settings selector pill. */
 .switcher {
   display: inline-flex;
@@ -330,8 +330,14 @@
   cursor: pointer;
 }
 
-.switcher:hover {
-  background: var(--dsw-alias-interactive-bg-hover);
+.switcher:active {
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+@media (hover: hover) {
+  .switcher:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .switcher:focus-visible {
@@ -415,13 +421,6 @@
   height: 12px;
 }
 
-.enabledIn {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 4px 10px;
-}
-
 .card[data-failed='true'] {
   border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent);
 }
@@ -502,5 +501,12 @@
 @container plugin-inventory (max-width: 520px) {
   .cards {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* iOS Safari zooms the visual viewport for a focused field under 16px. */
+@media (pointer: coarse) {
+  .search input {
+    font-size: 16px;
   }
 }

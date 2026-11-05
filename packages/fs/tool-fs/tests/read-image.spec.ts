@@ -5,9 +5,14 @@
  * commit + image-block rendering, attachment admission failures, and the
  * regression that `read` keeps its text-only contract.
  */
+import { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline'
+import { executeToolFixture, executeModelToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as PtcToolExecutor from '@deepseek-ai/dsh-tool-executor-ptc'
+import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vitest'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -17,7 +22,6 @@ import { ToolCallId, LlmAdapter, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { RUN_CODE_NAME } from '@deepseek-ai/dsh-tools'
-import type { Config as ToolConfig } from '@deepseek-ai/dsh-tools'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import * as FsPolicy from '@deepseek-ai/dsh-fs-observation-policy'
 import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
@@ -95,19 +99,23 @@ afterEach(async () => {
 })
 
 interface SetupOptions {
+  toolFs?: ToolFs.Config
   models?: LlmModelInfo[]
   resolvedModels?: LlmModelInfo[]
   attachments?: boolean
   llm?: boolean
   storeConfig?: { maxImageBytes?: number; maxImagePixels?: number; maxImageDimension?: number; maxMessageImageBytes?: number }
-  toolMode?: ToolConfig['mode']
+  toolMode?: ('native' | 'ptc')
 }
 
 async function setup(options: SetupOptions = {}) {
   const ctx = new Context()
+  onTestFinished(async () => { await ctx.fiber.dispose() })
+  provideWorkingDirectoryFixture(ctx)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime, { mode: options.toolMode ?? 'native' })
-  if (options.toolMode === 'ptc' || options.toolMode === 'both') {
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin((options.toolMode ?? 'native') === 'ptc' ? PtcToolExecutor : NativeToolExecutor)
+  if (options.toolMode === 'ptc') {
     await ctx.plugin(FakeRuntime)
   }
   await ctx.plugin(LocalFileSystem, { cwd: dir })
@@ -123,7 +131,7 @@ async function setup(options: SetupOptions = {}) {
       { provider: 'visual', id: 'legacy-model', name: 'Legacy' },
     ], options.resolvedModels))
   }
-  await ctx.plugin(ToolFs)
+  await ctx.plugin(ToolFs, options.toolFs ?? {})
   return ctx
 }
 
@@ -142,7 +150,8 @@ function agentOn(model: string | undefined, provider = 'visual', messages: reado
 
 let callCounter = 0
 function call(ctx: Context, name: string, args: unknown, agent?: object) {
-  return ctx.tools.execute({
+  const execute = name === RUN_CODE_NAME ? executeModelToolFixture : executeToolFixture
+  return execute(ctx, {
     signal: testToolSignal,
     callId: ToolCallId(`img-call-${++callCounter}`),
     name,
@@ -221,7 +230,7 @@ describe('read_image happy path', () => {
     expect(image.attachment.bytes).toBe(PNG_1X1.length)
     expect(image.attachment.name).toBe('red.png')
     expect(image.attachment.attachmentId).toMatch(/^sha256:[0-9a-f]{64}$/)
-    expect(text(result)).toBe(formatImageReadOutput(join(dir, 'red.png'), {
+    expect(text(result)).toBe(formatImageReadOutput(await realpath(join(dir, 'red.png')), {
       attachmentId: image.attachment.attachmentId,
       mediaType: 'image/png',
       bytes: PNG_1X1.length,
@@ -253,7 +262,7 @@ describe('read_image happy path', () => {
     expect(image.attachment.bytes).toBe(72)
     expect(image.attachment.name).toBe('red.gif')
     expect(image.attachment.attachmentId).toMatch(/^sha256:[0-9a-f]{64}$/)
-    expect(text(result)).toBe(formatImageReadOutput(join(dir, 'red.gif'), {
+    expect(text(result)).toBe(formatImageReadOutput(await realpath(join(dir, 'red.gif')), {
       attachmentId: image.attachment.attachmentId,
       mediaType: 'image/webp',
       bytes: 72,
@@ -299,7 +308,7 @@ describe('read_image happy path', () => {
     const result = await call(ctx, RUN_CODE_NAME, {
       code: 'return await tools.read_image({ file_path: "red.png" })',
       description: 'Read the image through PTC mode',
-    }, agentOn('vision-model'))
+    }, { ...agentOn('vision-model'), ctx })
 
     expect(result.isError).toBe(false)
     expect(result.content.every(block => block.type === 'text')).toBe(true)
@@ -344,7 +353,7 @@ describe('extension-less paths', () => {
     const reread = (second.content[1] as { attachment: ImageAttachmentRef }).attachment
     expect(reread.attachmentId).toBe(ref.attachmentId)
     expect(reread.mediaType).toBe('image/png')
-    expect(text(second)).toContain(`<path>${objectPath}</path>`)
+    expect(text(second)).toContain(`<path>${await realpath(objectPath)}</path>`)
   })
 
   it('reads an ordinary extension-less image file by sniffing its content', async () => {
@@ -510,9 +519,10 @@ describe('argument and service preconditions', () => {
     expect(text(nonImage)).toContain('the .txt extension does not declare a supported image format')
   })
 
-  it('refuses when no attachment service is mounted', async () => {
+  it.each([{}, { toolFs: { read: false, write: false, edit: false } }] satisfies SetupOptions[])
+  ('refuses when no attachment service is mounted: %j', async (config) => {
     await writeFile(join(dir, 'red.png'), PNG_1X1)
-    const ctx = await setup({ attachments: false })
+    const ctx = await setup({ ...config, attachments: false })
     expect(ctx.tools.get('read_image')).toBeUndefined()
     expect(ctx.tools.schemas().map(schema => schema.name)).not.toContain('read_image')
     const result = await readImage(ctx, { file_path: 'red.png' }, agentOn('vision-model'))
@@ -756,10 +766,56 @@ describe('image admission failures', () => {
 })
 
 describe('registration surface', () => {
+  it('registers only read_image without text guidance', async () => {
+    const ctx = await setup({ toolFs: { read: false, write: false, edit: false } })
+    try {
+      expect(ctx.tools.schemas().map(tool => tool.name)).toEqual(['read_image'])
+      expect((await ctx.systemPrompt.assemble()).sections.some(section => section.name.startsWith('tool:'))).toBe(false)
+      await writeFile(join(dir, 'red.png'), PNG_1X1)
+      const result = await readImage(ctx, { file_path: 'red.png' }, agentOn('vision-model'))
+      expect(result.isError).toBe(false)
+      expect(result.content.some(block => block.type === 'image')).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('omits read_image while an attachment store is mounted when readImage is false', async () => {
+    const ctx = await setup({ toolFs: { readImage: false } })
+    expect(ctx.tools.schemas().map(tool => tool.name).sort()).toEqual(['edit', 'read', 'write'])
+    expect(ctx.tools.get('read_image')).toBeUndefined()
+    expect((await readImage(ctx, { file_path: 'red.png' }, agentOn('vision-model'))).isError).toBe(true)
+  })
+
+  it('withdraws and restores image-only registration with the attachment store', async () => {
+    const ctx = new Context()
+    try {
+      provideWorkingDirectoryFixture(ctx)
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(NativeToolExecutor)
+      await ctx.plugin(LocalFileSystem, { cwd: dir })
+      const attachment = await ctx.plugin(LocalAttachmentStore, { dshHome: home })
+      const plugin = await ctx.plugin(ToolFs, { read: false, write: false, edit: false })
+      const names = () => ctx.tools.schemas().map(tool => tool.name).sort()
+      expect(names()).toEqual(['read_image'])
+      await attachment.dispose()
+      expect(names()).toEqual([])
+      await ctx.plugin(LocalAttachmentStore, { dshHome: home })
+      expect(names()).toEqual(['read_image'])
+      await plugin.dispose()
+      expect(names()).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('withdraws read_image when the tool-fs fiber or the attachment store is disposed (HMR safety)', async () => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime, { mode: 'native' })
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(LocalFileSystem, { cwd: dir })
     await ctx.plugin(FsPolicy)
     const attachmentsFiber = await ctx.plugin(LocalAttachmentStore, { dshHome: home })
@@ -784,7 +840,7 @@ describe('registration surface', () => {
 
   it('declares read_image parallel-safe and presents a read-family card', async () => {
     const ctx = await setup()
-    expect(ctx.tools.executionMode({
+    expect(new ToolExecutionPipeline(ctx).executionMode({
       signal: testToolSignal, callId: ToolCallId('img-parallel'), name: 'read_image', arguments: { file_path: 'a.png' },
     })).toEqual({ kind: 'parallel' })
     expect(ctx.tools.get('read_image')?.presentCall?.({ file_path: 'shot.png' })).toEqual({
@@ -840,7 +896,7 @@ describe('image result presentation', () => {
     const ctx = await setup()
     const result = await call(ctx, 'read_image', { file_path: 'red.png' }, agentOn('vision-model'))
     expect(result.isError).toBe(false)
-    expect(result.meta).toEqual({ path: join(dir, 'red.png') })
+    expect(result.meta).toEqual({ path: await realpath(join(dir, 'red.png')) })
     const image = result.content.find(block => block.type === 'image')
     expect(image?.attachment.width).toBe(1)
     expect(image?.attachment.height).toBe(1)

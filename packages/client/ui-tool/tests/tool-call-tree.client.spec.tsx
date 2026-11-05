@@ -6,11 +6,12 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { bindDisclosure, useDisclosure } from '@deepseek-ai/dsh-client-ui-chat/src/client/chat/use-disclosure.ts'
 import type { SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ToolCallBlock, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
-import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import { contextMenuHook, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type { ToolCallOwnerProps, ToolTreeProps } from '../src/client/contract/slots.ts'
 import { ToolCallTree } from '../src/client/tool/ToolCallTree.tsx'
 import { zh } from '@deepseek-ai/dsh-client-ui-conversation/src/client/locales.ts'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 
 afterEach(cleanup)
 
@@ -18,6 +19,7 @@ const t: ToolTreeProps['t'] = makeTranslate(zh, commonZh)
 
 const root = (callId: string, call: ToolResultNode['call']): ToolResultNode => ({
   kind: 'tool-result', seq: 3, time: 3_000, callId, call, callTime: 2_000,
+  name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
   content: [], isError: false, subCalls: [],
 })
 
@@ -48,12 +50,12 @@ function props(
       data: { root: block },
     },
     openFile: vi.fn(),
-    openSkill: vi.fn(),
-    renderMessageImages: () => null,
     inspectCall: vi.fn(),
     forkAt: vi.fn(),
     loadImage: vi.fn(() => Promise.reject(new Error('not used'))),
-    fileMentions: vi.fn(),
+    useContextMenu: contextMenuHook(),
+    sessionId: 'original' as ToolTreeProps['sessionId'],
+    resolveFilePath: path => path,
     useHostInfo: ((selector: (info: { home: string | undefined }) => unknown) => selector({ home })) as ToolTreeProps['useHostInfo'],
     t,
   }
@@ -61,6 +63,25 @@ function props(
 }
 
 describe('ToolCallTree', () => {
+  it('binds root and nested fallback files without a Markdown provider', () => {
+    const block = { ...root('parent', { name: 'read', argsRaw: '{"file_path":"parent.ts"}' }),
+      subCalls: [root('child', { name: 'read', argsRaw: '{"file_path":"child.ts"}' })] }
+    const opened = vi.fn()
+    const input = props(block)
+    let directory = '/old'
+    const view = render(<ToolCallTree {...input}
+      useContextMenu={contextMenuHook(opened)} resolveFilePath={path => `${directory}/${path}`} />)
+    directory = '/current'
+    fireEvent.contextMenu(view.getByRole('button', { name: 'parent.ts' }), { clientX: 12, clientY: 34 })
+    fireEvent.keyDown(view.getByRole('button', { name: 'child.ts' }), { key: 'F10', shiftKey: true })
+    expect(opened.mock.calls).toEqual([
+      [{ kind: 'file', value: { sessionId: 'original', path: '/current/parent.ts' } }, { x: 12, y: 34 }],
+      [{ kind: 'file', value: { sessionId: 'original', path: '/current/child.ts' } }, { x: 0, y: 0 }],
+    ])
+    expect(input.openFile).not.toHaveBeenCalled()
+    expect(view.container.querySelector('[aria-expanded="true"]')).toBeNull()
+  })
+
   it('dispatches only the parent and changed child among 100 sibling calls', () => {
     const children = Array.from({ length: 100 }, (_, index) => root(`child-${index}`, { name: 'custom_child', argsRaw: '{}' }))
     const block = { ...root('parent', { name: 'custom_parent', argsRaw: '{}' }), subCalls: children }
@@ -78,7 +99,7 @@ describe('ToolCallTree', () => {
   it('dispatches preparation through the existing keyed toolview with no argument fields', () => {
     const owners: ToolCallOwnerProps[] = []
     const view = render(<ToolCallTree {...props({
-      phase: 'preparing', callId: 'preparing', name: 'write', turn: 1, step: 1, time: 1, subCalls: [],
+      phase: 'preparing', args: PartialArguments.EMPTY, callId: 'preparing', name: 'write', turn: 1, step: 1, time: 1, subCalls: [],
     }, undefined, owners)} />)
     expect(owners[0]).toMatchObject({ phase: 'preparing', callId: 'preparing', toolName: 'write' })
     expect(owners[0]?.block).not.toHaveProperty('argsRaw')
@@ -164,7 +185,7 @@ describe('ToolCallTree', () => {
   it('dispatches a running call by its wire name and forwards inspect', () => {
     const owners: ToolCallOwnerProps[] = []
     const block: ToolCallBlock = {
-      phase: 'start' as const, callId: 'running', name: 'bash', argsRaw: '{"command":"pwd"}',
+      phase: 'start' as const, args: PartialArguments.fromText('{"command":"pwd"}'), callId: 'running', name: 'bash', argsRaw: '{"command":"pwd"}',
       turn: 1, step: 0, time: 1_000, subCalls: [],
     }
     const treeProps = props(block, undefined, owners)

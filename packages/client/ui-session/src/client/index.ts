@@ -12,6 +12,7 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import type { AccessEffect, RemoteEndpoint } from '@deepseek-ai/dsh-api-remote-access/client'
 import { notifySubscribers } from '@deepseek-ai/dsh-client-store'
 import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
 import { standardHookPropName } from '@deepseek-ai/dsh-client-ui-slots'
@@ -158,6 +159,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     useSessions: UseSessions
     useSessionStatus: UseSessionStatus
     useSessionRetainInfo: UseSessionRetainInfo
+    /** Whether the current Peer may call `action` on one Session resource. */
+    useSessionAccess: (sessionId: SessionId, action: RemoteEndpoint) => boolean
   }
 
   interface SessionStandardProps {
@@ -167,6 +170,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     sessionId: SessionId
     /** Host-computed projection values addressed by projection key. */
     useProjection: UseProjection
+    /** Whether the current Peer may call `action` on this Session resource. */
+    useAccess: (action: RemoteEndpoint) => boolean
   }
 
   interface SessionMaybeStandardProps {
@@ -176,6 +181,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     sessionId: SessionId | undefined
     /** Host-computed projection values; every key is absent without a Session. */
     useProjection: UseProjection
+    /** The bound Session's access answer; `undefined` without a Session, which callers treat as not allowed. */
+    useAccess: (action: RemoteEndpoint) => boolean | undefined
   }
 }
 
@@ -351,6 +358,24 @@ export class UiSession extends Service {
       throw new Error('ui-session: Session reference is not active in this Controller')
     }
     return this.sourceFor(owner)
+  }
+
+  /**
+   * Keep `callback`'s effects installed while the current Peer may call
+   * `action` on one Session resource, with the semantics of
+   * `ctx.remoteAccess.whenAccess`: `useSessionAccess` answers the same
+   * question during render.
+   * @param sessionId - the Session resource the guarded effects depend on.
+   * @param action - endpoint action the guarded effects depend on.
+   * @param callback - creates one disposer or an iterable of disposers.
+   * @returns idempotent disposer owned by the caller's Cordis fiber.
+   */
+  whenAccess(sessionId: SessionId, action: RemoteEndpoint, callback: () => AccessEffect): () => void {
+    // `ctx.get` traces the service to the caller's Context, which then owns the controller.
+    const access = this.ctx.get('remoteAccess')
+    /* v8 ignore next -- this plugin injects remoteAccess, so the service is active while uiSession is reachable. */
+    if (access === undefined) throw new Error('ui-session: whenAccess requires the remoteAccess service')
+    return access.whenResourceAccess('session', sessionId, action, callback)
   }
 
   /**
@@ -660,8 +685,8 @@ function claimStandardProp(kind: StandardMemberKind, name: string, finalProps: S
   finalProps.add(propName)
 }
 
-/** Required Controller and renderer services. */
-export const inject = ['sessions', 'slots', 'remote']
+/** Required Controller, renderer, Remote, and access services. */
+export const inject = ['sessions', 'slots', 'remote', 'remoteAccess']
 
 /**
  * Install the Session root source and scoped adapter.
@@ -676,9 +701,18 @@ export function apply(ctx: Context): void {
     },
     keyedHooks: {
       sessionRetainInfo: key => ctx.sessions.retainInfo(key as SessionId),
+      sessionAccess: (sessionId, action) => action === undefined
+        ? undefined
+        : ctx.remoteAccess.source('session', sessionId, action),
     },
   } satisfies RootStandardSourceContribution)
   ctx.slots.installScope('session', service.adapter)
+  service.provide({
+    keyedHooks: ['access'],
+    resolve: binding => ({
+      keyedHooks: { access: action => ctx.remoteAccess.source('session', binding.sessionId, action) },
+    }),
+  })
 }
 
 function sameSessionStatus(left: SessionStatusSnapshot, right: SessionStatusSnapshot): boolean {

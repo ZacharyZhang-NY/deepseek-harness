@@ -1,11 +1,19 @@
 - button "Back to plugins": Plugins
 - button "Uninstall @fixture/bundle": Uninstall
+- status
 - switch "Enable @fixture/bundle"
 - heading "@fixture/bundle" [level=3]
 - text: v0.0.1
 - paragraph:
   - code: "@fixture/bundle"
 - paragraph: Registry description for the fixture bundle.
+- region "Details":
+  - heading "Fixture bundle" [level=1]
+  - paragraph: English | 中文
+  - paragraph:
+    - text: Registry fixture for the Web plugin-manager tests. It declares no
+    - code: meta.detail
+    - text: ", so its page shows this README."
 - heading "Components" [level=4]
 - text: 3 total · 3 off
 - list:
@@ -14,7 +22,7 @@
     - code: fixture-row
     - text: "Off"
   - listitem:
-    - text: File Search Search package introduction.
+    - text: File Search
     - code: fixture-search
     - code: "@fixture/bundle/search"
     - text: "Off"
@@ -22,3 +30,9 @@
     - text: "@fixture/bundle/review"
     - code: fixture-review
     - text: "Off"
+- heading "Source" [level=4]
+- term: Code source
+- definition:
+  - code: file:{{fixtures}}/fixture-bundle
+- term: Current version
+- definition: 0.0.1

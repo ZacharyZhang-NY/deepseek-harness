@@ -63,15 +63,20 @@ function chunkUrl(row: BootModuleRow, fileName: string, rev: string): string {
   return `${url.slice(0, resourceStart)}/${row.id}/${fileName}?${url.slice(revisionStart + 1)}`
 }
 
+/** Untagged <style> elements present before a factory runs; the factory must not claim them. */
+const untaggedStyles = (): ReadonlySet<Element> =>
+  typeof document === 'undefined' ? new Set() : new Set(document.querySelectorAll('style:not([data-plugin])'))
+
 /**
  * Claim and inventory the <style> tags a factory injected during
  * materialization: preset-emitted tags arrive pre-tagged with data-plugin;
- * any untagged tag is claimed for the materializing plugin (HMR bookkeeping).
+ * an untagged tag that was absent from `before` is claimed for the
+ * materializing plugin (HMR bookkeeping).
  */
-const claimStyles = (id: string): string[] => {
+const claimStyles = (id: string, before: ReadonlySet<Element>): string[] => {
   if (typeof document === 'undefined') return []
-  for (const el of document.querySelectorAll('style:not([data-plugin])')) {
-    el.setAttribute('data-plugin', id)
+  for (const el of untaggedStyles()) {
+    if (!before.has(el)) el.setAttribute('data-plugin', id)
   }
   const owned: string[] = []
   for (const el of document.querySelectorAll(`style[data-plugin=${JSON.stringify(id)}]`)) {
@@ -106,6 +111,7 @@ export class ClientModuleSystem implements ClientModuleLoader {
   private readonly materializing = new Set<string>()
   private readonly graphRows = new Map<string, BootModuleRow>()
   private readonly loadBundle: (url: string) => Promise<void>
+  private readonly resolveAsset: (reference: string) => string
   /** Last import or prefetch failure per graph row, cleared by a later success or invalidation. */
   private readonly importErrors = new Map<string, Error>()
   /** Batch URLs whose transport or execution already failed; rows still missing from them go straight to their one-resource URL. */
@@ -129,6 +135,7 @@ export class ClientModuleSystem implements ClientModuleLoader {
     })
     this.seed = new Map(Object.entries(options.staticModules))
     this.loadBundle = options.loadBundle ?? defaultLoadBundle
+    this.resolveAsset = options.resolveAsset ?? (reference => reference)
 
     for (const row of options.manifest.modules) {
       this.graphRows.set(row.id, row)
@@ -300,13 +307,15 @@ export class ClientModuleSystem implements ClientModuleLoader {
       throw new Error(`client-modules: require cycle through "${id}" (factory-form CJS cannot deliver partial exports)`)
     }
     this.materializing.add(id)
+    const before = untaggedStyles()
     try {
       const edges = new Set<string>()
       const exports = registered.factory(this.makeRequire(ownerId, edges))
-      const record: ClientModuleRecord = { id, exports, styles: claimStyles(ownerId), edges }
+      const record: ClientModuleRecord = { id, exports, styles: claimStyles(ownerId, before), edges }
       this.loadCache.set(id, record)
       return record
     } catch (error) {
+      claimStyles(ownerId, before)
       removeOwnedStyles(ownerId)
       throw error
     } finally {
@@ -314,7 +323,7 @@ export class ClientModuleSystem implements ClientModuleLoader {
     }
   }
 
-  /** Build the synchronous module-table require and its asynchronous chunk operation. */
+  /** Build the synchronous module-table require, its asynchronous chunk operation, and its asset resolver. */
   private makeRequire(ownerId: string, edges: Set<string>): ClientBundleRequire {
     const require = (spec: string): unknown => {
       edges.add(spec)
@@ -328,6 +337,7 @@ export class ClientModuleSystem implements ClientModuleLoader {
         + 'and no registered package factory (a build-time externals drift, or a dynamic dependency that did not arrive)',
       )
     }
+    require.asset = (reference: string): string => this.resolveAsset(reference)
     require.async = async (spec: string): Promise<unknown> => {
       edges.add(spec)
       if (!spec.startsWith('./')) return await this.import(spec)

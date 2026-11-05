@@ -42,6 +42,39 @@ type LangModule = { default: typeof langTs }
 const LANGS = [langTs, langBash, langJson]
 
 /**
+ * Replace the Go grammar's repeated one-line struct-field rule with the rule
+ * worlpaker/go-syntax merged in 4a9b120a52c (https://github.com/worlpaker/go-syntax/pull/25):
+ * the repeated rule backtracks exponentially on lines such as a brace-bearing
+ * comment after `struct {`. Delete this patch once `@shikijs/langs` ships that
+ * commit; 4.5.0 does not. The rule is located as the only rule in
+ * `struct_variables_types_fields` containing the field-token literal below,
+ * taken from `@shikijs/langs` 4.4.3.
+ * @param grammars - the `@shikijs/langs/go` default export, left unmodified.
+ * @returns copies of `grammars` with that rule's match replaced in the `go` grammar.
+ * @throws When the module has no `go` grammar, the grammar lacks
+ * `struct_variables_types_fields`, or that entry has no or several such rules.
+ * The lazy load then rejects unhandled and Go code renders as plain text.
+ */
+export function patchGoGrammar(grammars: LangModule['default']): LangModule['default'] {
+  const go = grammars.find(grammar => grammar.name === 'go')
+  const fields = go?.repository.struct_variables_types_fields
+  const patterns = fields?.patterns ?? []
+  const rules = patterns.filter(rule => typeof rule.match === 'string' && rule.match.includes('[^"/`\\s]+;?'))
+  if (go === undefined || fields === undefined || rules.length !== 1) {
+    throw new Error(`ui-primitives: expected exactly one Go struct-field rule to patch for worlpaker/go-syntax#25, found ${
+      rules.length}; update or delete the patch`)
+  }
+  const repository = { ...go.repository }
+  repository.struct_variables_types_fields = {
+    ...fields,
+    patterns: patterns.map(rule => rule === rules[0]
+      ? { ...rule, match: '(?:(?<=\\{)([^/\\`"]*[^\\s/\\`"])\\s*(?=\\}))' }
+      : rule),
+  }
+  return grammars.map(grammar => grammar === go ? { ...go, repository } : grammar)
+}
+
+/**
  * The non-boot extension grammars, each behind a dynamic import so its module
  * stays out of the boot chunk until a code surface renders that language.
  * Keyed by the grammar id (`LanguageRegistration.name`) the aliases resolve to.
@@ -53,7 +86,7 @@ const LANGS = [langTs, langBash, langJson]
 const LAZY_GRAMMARS = new Map<string, () => Promise<LangModule>>([
   ['python', () => import('@shikijs/langs/python')],
   ['ruby', () => import('@shikijs/langs/ruby')],
-  ['go', () => import('@shikijs/langs/go')],
+  ['go', async () => ({ default: patchGoGrammar((await import('@shikijs/langs/go')).default) })],
   ['rust', () => import('@shikijs/langs/rust')],
   ['java', () => import('@shikijs/langs/java')],
   ['c', () => import('@shikijs/langs/c')],
@@ -275,6 +308,16 @@ const regexEngine = createJavaScriptRegexEngine({
   }),
 })
 
+/**
+ * Lines at least this many UTF-16 units long render as one uncolored token.
+ * With the JavaScript regex engine, scanning one JavaScript string-literal
+ * line costs about 70 ms at 1,000 units, 300 ms at 2,000, 600 ms at 5,000 and
+ * 2.5 s at 10,000, so this cap keeps one line within a few frames. A skipped
+ * line leaves the grammar state unchanged: a multi-line construct that opens
+ * or closes on it colors the following lines as if the line were absent.
+ */
+const TOKENIZE_MAX_LINE_LENGTH = 1000
+
 let singleton: HighlighterCore | undefined
 
 /** Representative paths through every boot grammar, compiled before user content is timed. */
@@ -386,7 +429,9 @@ export function highlightToHtml(code: string, lang: string | undefined): string 
   const resolved = grammarForHint(lang)
   if (resolved === undefined) return undefined
   if (!ensureGrammar(resolved)) return undefined
-  return highlighter().codeToHtml(code, { lang: resolved, theme: 'css-variables' })
+  return highlighter().codeToHtml(code, {
+    lang: resolved, theme: 'css-variables', tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
+  })
 }
 
 /**
@@ -492,6 +537,7 @@ export class StreamingHighlightSession {
     return highlighter().codeToTokensBase(text, {
       lang: resolved,
       theme: 'css-variables',
+      tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
       ...(this.state === undefined ? {} : { grammarState: this.state }),
     })
   }
@@ -586,7 +632,9 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
   const resolved = grammarForHint(lang)
   if (resolved === undefined) return undefined
   if (!ensureGrammar(resolved)) return undefined
-  const { tokens } = highlighter().codeToTokens(code, { lang: resolved, theme: 'css-variables' })
+  const { tokens } = highlighter().codeToTokens(code, {
+    lang: resolved, theme: 'css-variables', tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH,
+  })
   // shiki tokenizes `a\nb` into two lines; a trailing newline (`a\n`) adds a
   // third, empty line the caller's own line array does not carry. Drop that
   // one terminator line so the two structures stay in step. The explicit

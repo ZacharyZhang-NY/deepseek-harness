@@ -3,7 +3,7 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { LlmAttemptId } from '@deepseek-ai/dsh-llm/brand'
 import type {
-  ConversationContextReader, ConversationLocationData, ConversationMatch,
+  ConversationContextReader, ConversationLocationData, ConversationMatch, ConversationMatchResult,
   ConversationNodeContext, ConversationNodeDefinition, ConversationPreviousContext,
   ConversationLocationDataScope, ConversationPublication, ConversationViewBuilder,
   ConversationStartMatch,
@@ -15,6 +15,7 @@ import type {
   ConversationGroupData, ConversationGroupDefinition, ConversationGroupedView,
 } from '../contract/groups.ts'
 import { ConversationGroupStore } from './group-store.ts'
+import type { ConversationEventRegistry } from './event-registry.ts'
 import {
   ConversationLocationIndex, type ConversationLocationDataChange,
 } from './location-index.ts'
@@ -60,6 +61,30 @@ interface GroupState {
   readonly definition: ConversationGroupDefinition
   state: unknown
   readonly store: ConversationGroupStore<unknown>
+}
+
+/**
+ * Failure of an incremental Conversation update.
+ * When `rebuilt` is true, every active view already shows a complete rebuild of
+ * the loaded window, and `cause` is the original failure. When it is false, the
+ * rebuild or its view replacement also failed, and `cause` is an
+ * `AggregateError` of both failures; the next flush retries that rebuild or replacement.
+ */
+export class ConversationUpdateError extends Error {
+  /** Whether every active view shows the complete rebuild. */
+  readonly rebuilt: boolean
+
+  /**
+   * @param rebuilt - whether every active view shows the complete rebuild.
+   * @param options - the original failure, or an `AggregateError` of both failures, as `cause`.
+   */
+  constructor(rebuilt: boolean, options: ErrorOptions) {
+    super(rebuilt
+      ? 'conversation update failed; the loaded window was rebuilt'
+      : 'conversation update failed, and rebuilding the loaded window also failed', options)
+    this.name = 'ConversationUpdateError'
+    this.rebuilt = rebuilt
+  }
 }
 
 const PUBLICATION_RANK: Record<ConversationPublication, number> = {
@@ -143,7 +168,7 @@ function conversationMatch(
 }
 
 /** Event Registry subset consumed by a Session-owned Assembler. */
-export interface ConversationEventDefinitions {
+export interface ConversationEventDefinitions extends Partial<Pick<ConversationEventRegistry, 'forEvent'>> {
   /** @returns ordinary Definitions in registration order. */
   entries(): readonly ConversationNodeDefinition[]
   /** @returns unmatched-event fallback, when registered. */
@@ -173,7 +198,7 @@ const NO_GROUPS: ConversationGroupDefinitions = { entries: () => [], forTarget: 
 export class ConversationNodeAssembler implements ConversationViewSnapshotStore {
   private readonly contexts = new Map<string, InternalContext>()
   private readonly contextsByKind = new Map<string, InternalContext[]>()
-  private readonly contextsBySeq = new Map<number, Set<InternalContext>>()
+  private readonly contextsBySeq = new Map<number, InternalContext[]>()
   private readonly contextsByTarget = new Map<string, Set<InternalContext>>()
   private readonly inputs = new Map<number, SessionEventLikeEntry>()
   private readonly locationIndex = new ConversationLocationIndex()
@@ -185,7 +210,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   private readonly groups = new Map<string, GroupState>()
   private readonly pendingGroupStores = new Set<ConversationGroupStore<unknown>>()
   private readonly activeTargets = new Set<string>()
+  /** Matches of the event in dispatch, kept by index; dispatch is not reentrant and reuses both arrays. */
+  private readonly matchedDefinitions: ConversationNodeDefinition[] = []
+  private readonly matchedResults: ConversationMatchResult[] = []
   private hasMore = false
+  private rebuildPending = false
   private replacePending = true
   private timelineDirty = true
 
@@ -250,7 +279,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   append(record: SessionEventLikeEntry): ConversationPublication {
     const event = record.event
     if (this.inputs.has(event.seq)) return 'none'
-    this.revised.clear()
+    if (this.revised.size > 0) this.revised.clear()
     this.inputs.set(event.seq, record)
     let publication: ConversationPublication = 'none'
     if (event.type !== 'assistant/live-chunk' && isLocationBoundary(event.type)) {
@@ -267,7 +296,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     }
     publication = maximumPublication(publication, this.matchInput(record))
     if (this.replayRevisedDependents()) publication = 'immediate'
-    this.revised.clear()
+    if (this.revised.size > 0) this.revised.clear()
     return publication
   }
 
@@ -358,27 +387,65 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
 
   /**
    * Materialize dirty Contexts and advance every active view builder.
+   * When an incremental update throws, the assembler replays the complete loaded
+   * window into new Contexts and replaces every active view before it throws a
+   * {@link ConversationUpdateError}. A Definition that throws on every incremental
+   * update therefore makes each flush replay the whole window. A failure on the
+   * complete-replacement path propagates unchanged, publishes no view, and keeps
+   * the replacement pending for the next flush.
    * @returns whether any view snapshot was rebuilt or incrementally applied.
+   * @throws {@link ConversationUpdateError} when an incremental update fails.
    */
   flush(): boolean {
+    if (this.rebuildPending) this.rebuildWindow()
     if (!this.replacePending && this.dirty.size === 0 && !this.timelineDirty) return false
-    if (this.replacePending) {
-      this.replaceLocationData()
-      const updated: ViewState[] = []
-      const changedTurns = this.locationIndex.takeChangedTurns()
-      for (const target of this.activeTargets) {
-        const view = this.views.get(target)
-        if (view === undefined) continue
-        this.updateView(view, true, this.buildTargetNodes(target, this.contextsByTarget.get(target)), changedTurns)
-        updated.push(view)
-      }
-      this.replacePending = false
-      this.dirty.clear()
-      this.dirtyByTarget.clear()
-      this.timelineDirty = false
-      return this.publishViews(updated)
-    }
+    if (this.replacePending) return this.flushReplacement()
 
+    try {
+      return this.flushIncremental()
+    } catch (error: unknown) {
+      return this.recoverIncremental(error)
+    }
+  }
+
+  private flushReplacement(): boolean {
+    this.replaceLocationData()
+    const updated: ViewState[] = []
+    const changedTurns = this.locationIndex.takeChangedTurns()
+    for (const target of this.activeTargets) {
+      const view = this.views.get(target)
+      if (view === undefined) continue
+      this.updateView(view, true, this.buildTargetNodes(target, this.contextsByTarget.get(target)), changedTurns)
+      updated.push(view)
+    }
+    this.replacePending = false
+    this.dirty.clear()
+    this.dirtyByTarget.clear()
+    this.timelineDirty = false
+    return this.publishViews(updated)
+  }
+
+  /** Replace partial incremental state with a complete rebuild, then report the original failure. */
+  private recoverIncremental(error: unknown): never {
+    try {
+      this.rebuildWindow()
+      this.flushReplacement()
+    } catch (recoveryError: unknown) {
+      throw new ConversationUpdateError(false, {
+        cause: new AggregateError([error, recoveryError], 'conversation update and its rebuild failed'),
+      })
+    }
+    throw new ConversationUpdateError(true, { cause: error })
+  }
+
+  /** Rebuild every Context from the loaded inputs; a failed rebuild stays pending for the next flush. */
+  private rebuildWindow(): void {
+    this.rebuildPending = true
+    this.replaceWindow(this.sortedInputs(), this.hasMore)
+    this.rebuildPending = false
+  }
+
+  private flushIncremental(): boolean {
     const updated: ViewState[] = []
     if (this.applyDirtyLocationData()) this.timelineDirty = true
     const changedTurns = this.locationIndex.takeChangedTurns()
@@ -401,7 +468,8 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
 
   /**
    * Add one target to the monotonic active set and materialize its current snapshot.
-   * Pending Context work is flushed before the first complete replacement.
+   * Pending Context work is flushed before the first complete replacement. When that
+   * flush throws, the target stays inactive and a later activation retries it.
    * @param target - registered or subsequently registered view target.
    * @returns whether any active target snapshot changed.
    */
@@ -456,21 +524,16 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   }
 
   private matchInput(input: SessionEventLikeEntry): ConversationPublication {
-    return this.dispatchInput(input, (definition, id, role) =>
-      this.acceptMatch(definition, id, role, input))
+    // oxlint-disable-next-line typescript/unbound-method -- dispatchInput supplies the assembler receiver
+    return this.dispatchInput(input, this.acceptMatch)
   }
 
   private collectInput(
     input: SessionEventLikeEntry,
     pending: Map<string, PendingMatch[]>,
   ): ConversationPublication {
-    return this.dispatchInput(input, (definition, id, role) => {
+    return this.dispatchInput(input, (definition, id, match) => {
       const key = conversationContextKey(definition.kind, id)
-      const match = conversationMatch(
-        input,
-        role,
-        this.locationIndex.locationOf(input.event),
-      )
       const matches = pending.get(key) ?? []
       matches.push({ definition, id, match })
       pending.set(key, matches)
@@ -481,26 +544,81 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   private dispatchInput(
     input: SessionEventLikeEntry,
     accept: (
+      this: ConversationNodeAssembler,
       definition: ConversationNodeDefinition,
       id: string,
-      role: ConversationMatch['role'],
+      match: ConversationMatch,
     ) => ConversationPublication,
   ): ConversationPublication {
     const event = input.event
-    const matchedTargets = new Set<string>()
+    let startMatch: ConversationMatch | undefined
+    let updateMatch: ConversationMatch | undefined
+    let location: ConversationMatch['location'] | undefined
+    const matchFor = (role: ConversationMatch['role']): ConversationMatch => {
+      location ??= this.locationIndex.locationOf(event)
+      return role === 'start'
+        ? startMatch ??= conversationMatch(input, role, location)
+        : updateMatch ??= conversationMatch(input, role, location)
+    }
+    const definitions = this.matchedDefinitions
+    const results = this.matchedResults
+    definitions.length = 0
+    results.length = 0
+    const routes = this.eventDefinitions.forEvent?.(event.type)
+    if (routes === undefined) {
+      for (const definition of this.eventDefinitions.entries()) {
+        const result = definition.match(event)
+        if (result === null) continue
+        definitions.push(definition)
+        results.push(result)
+      }
+    } else {
+      for (const { definition, match } of routes) {
+        const result = match(event)
+        if (result === null) continue
+        definitions.push(definition)
+        results.push(result)
+      }
+    }
+    // Claims are resolved before any acceptance, so the outcome does not depend on registration order.
+    let claims: Map<string, string> | undefined
+    for (let index = 0; index < results.length; index++) {
+      if ((results[index] as ConversationMatchResult).exclusive !== true) continue
+      const definition = definitions[index] as ConversationNodeDefinition
+      const target = definition.target
+      if (target === undefined) {
+        throw new Error(`conversation Definition "${definition.kind}" claims ${event.type} at seq ${String(event.seq)} without a target`)
+      }
+      const claimant = claims?.get(target)
+      if (claimant !== undefined) {
+        throw new Error(`conversation Definitions "${claimant}" and "${definition.kind}" both claim ${event.type} at seq ${String(event.seq)} on target "${target}"`)
+      }
+      (claims ??= new Map()).set(target, definition.kind)
+    }
+    let firstTarget: string | undefined
+    let secondTarget: string | undefined
+    let otherTargets: Set<string> | undefined
     let publication: ConversationPublication = 'none'
-    for (const definition of this.eventDefinitions.entries()) {
-      const result = definition.match(event)
-      if (result === null) continue
-      if (definition.target !== undefined) matchedTargets.add(definition.target)
-      publication = maximumPublication(publication, accept(definition, result.id, result.role))
+    for (let index = 0; index < results.length; index++) {
+      const definition = definitions[index] as ConversationNodeDefinition
+      const result = results[index] as ConversationMatchResult
+      const target = definition.target
+      if (target !== undefined && result.exclusive !== true && claims?.has(target) === true) continue
+      // Inline target tracking avoids an additional closure allocation for each event.
+      if (target !== undefined && target !== firstTarget && target !== secondTarget) {
+        if (firstTarget === undefined) firstTarget = target
+        else if (secondTarget === undefined) secondTarget = target
+        else (otherTargets ??= new Set()).add(target)
+      }
+      publication = maximumPublication(publication, accept.call(this, definition, result.id, matchFor(result.role)))
     }
     const fallback = this.eventDefinitions.fallbackEntry()
     const target = fallback?.target
-    if (fallback !== undefined && target !== undefined && !matchedTargets.has(target)) {
+    if (fallback !== undefined && target !== undefined
+      && target !== firstTarget && target !== secondTarget && otherTargets?.has(target) !== true) {
       const result = fallback.match(event)
       if (result !== null) {
-        publication = maximumPublication(publication, accept(fallback, result.id, result.role))
+        publication = maximumPublication(publication, accept.call(this, fallback, result.id, matchFor(result.role)))
       }
     }
     return publication
@@ -533,34 +651,32 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   private acceptMatch(
     definition: ConversationNodeDefinition,
     id: string,
-    role: ConversationMatch['role'],
-    input: SessionEventLikeEntry,
+    match: ConversationMatch,
   ): ConversationPublication {
-    const key = conversationContextKey(definition.kind, id)
+    const latest = this.contextsByKind.get(definition.kind)?.at(-1)
+    const key = latest?.id === id ? latest.key : conversationContextKey(definition.kind, id)
     let context = this.contexts.get(key)
     context ??= this.createContext(definition, id, key)
-    const starting = role === 'start' && context.start === undefined
-    const match = conversationMatch(
-      input,
-      role,
-      this.locationIndex.locationOf(input.event),
-    )
+    const starting = match.role === 'start' && context.start === undefined
     const previous = context.matches.at(-1)
-    if (previous !== undefined && previous.event.seq >= input.event.seq) {
-      throw new Error(`conversation Context ${key} received non-appended Match ${input.event.seq}`)
+    if (previous !== undefined && previous.event.seq >= match.event.seq) {
+      throw new Error(`conversation Context ${key} received non-appended Match ${match.event.seq}`)
     }
     if (starting && context.matches.length > 0) {
       throw new Error(`conversation Context ${key} received an update before its start Match`)
     }
     context.matches.push(match)
-    if (starting && match.role === 'start') {
-      context.startSeq = input.event.seq
+    if (starting) {
+      context.startSeq = match.event.seq
       context.start = match
       this.indexStartedContext(context)
     }
-    const owners = this.contextsBySeq.get(input.event.seq) ?? new Set<InternalContext>()
-    owners.add(context)
-    this.contextsBySeq.set(input.event.seq, owners)
+    let owners = this.contextsBySeq.get(match.event.seq)
+    if (owners === undefined) {
+      owners = []
+      this.contextsBySeq.set(match.event.seq, owners)
+    }
+    owners.push(context)
 
     if (starting) {
       this.replayContext(context)
@@ -588,9 +704,12 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
           if (entry.definition !== context.definition || entry.id !== context.id) {
             throw new Error(`conversation Context ${key} received inconsistent Definition identity`)
           }
-          const owners = this.contextsBySeq.get(entry.match.event.seq) ?? new Set<InternalContext>()
-          owners.add(context)
-          this.contextsBySeq.set(entry.match.event.seq, owners)
+          let owners = this.contextsBySeq.get(entry.match.event.seq)
+          if (owners === undefined) {
+            owners = []
+            this.contextsBySeq.set(entry.match.event.seq, owners)
+          }
+          owners.push(context)
           return entry.match
         })
         .sort((left, right) => left.event.seq - right.event.seq)
@@ -679,12 +798,16 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   }
 
   private markDirty(context: InternalContext): void {
+    if (this.dirty.has(context)) return
     this.dirty.add(context)
     const target = context.definition.target
     if (target === undefined || !this.activeTargets.has(target)) return
-    const contexts = this.dirtyByTarget.get(target) ?? new Set<InternalContext>()
+    let contexts = this.dirtyByTarget.get(target)
+    if (contexts === undefined) {
+      contexts = new Set<InternalContext>()
+      this.dirtyByTarget.set(target, contexts)
+    }
     contexts.add(context)
-    this.dirtyByTarget.set(target, contexts)
   }
 
   private replaceDependencies(context: InternalContext, dependencies: Map<string, Dependency>): void {
@@ -704,6 +827,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   }
 
   private replayRevisedDependents(): boolean {
+    if (this.dependents.size === 0) return false
     const pending = [...this.revised]
     const affected = new Set<InternalContext>()
     for (let index = 0; index < pending.length; index++) {
@@ -715,7 +839,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
         pending.push(dependent)
       }
     }
-    this.replayContexts(affected)
+    if (affected.size > 0) this.replayContexts(affected)
     return affected.size > 0
   }
 

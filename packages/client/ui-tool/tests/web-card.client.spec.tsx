@@ -9,9 +9,10 @@ import { IconGlobeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { webCardModel, webFetchHref } from '../src/client/tool/models/web-card-model.ts'
 import { GenericToolCard } from '../src/client/tool/toolviews/GenericToolCard.tsx'
 import { WebRow, webToolview } from '../src/client/tool/toolviews/web-row.tsx'
-import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import { contextMenuHook, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import { zh } from '@deepseek-ai/dsh-client-ui-conversation/src/client/locales.ts'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 
 afterEach(cleanup)
 
@@ -49,26 +50,37 @@ const fetchMeta = (over?: Partial<FetchMeta>): FetchMeta => ({
   url: 'https://example.com/page', statusCode: 200, truncated: false, ...over,
 })
 
-const runningSearch = (over?: Partial<StartedToolCall>): StartedToolCall => ({
-  phase: 'start' as const, callId: 'c1', name: 'web_search', argsRaw: SEARCH_ARGS,
-  turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
-})
+const runningSearch = (over?: Partial<StartedToolCall>): StartedToolCall => {
+  const argsRaw = over?.argsRaw ?? SEARCH_ARGS
+  return {
+    phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId: 'c1', name: 'web_search', argsRaw,
+    turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
+  }
+}
 
-const settledSearch = (over?: Partial<ToolResultNode>): ToolResultNode => ({
-  kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
-  call: { name: 'web_search', argsRaw: SEARCH_ARGS },
-  callTime: 1_000,
-  content: [{ type: 'text', text: 'search text' }], isError: false,
-  meta: searchMeta(), subCalls: [], ...over,
-})
+const settledSearch = (over?: Partial<ToolResultNode>): ToolResultNode => {
+  const call = over?.call === undefined ? { name: 'web_search', argsRaw: SEARCH_ARGS } : over.call
+  return {
+    kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
+    callTime: 1_000,
+    content: [{ type: 'text', text: 'search text' }], isError: false,
+    meta: searchMeta(), subCalls: [], ...over,
+  }
+}
 
-const settledFetch = (over?: Partial<ToolResultNode>): ToolResultNode => ({
-  kind: 'tool-result', seq: 11, time: 2_000, callId: 'c2',
-  call: { name: 'web_fetch', argsRaw: FETCH_ARGS },
-  callTime: 1_000,
-  content: [{ type: 'text', text: 'fetch body' }], isError: false,
-  meta: fetchMeta(), subCalls: [], ...over,
-})
+const settledFetch = (over?: Partial<ToolResultNode>): ToolResultNode => {
+  const call = over?.call === undefined ? { name: 'web_fetch', argsRaw: FETCH_ARGS } : over.call
+  return {
+    kind: 'tool-result', seq: 11, time: 2_000, callId: 'c2',
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
+    callTime: 1_000,
+    content: [{ type: 'text', text: 'fetch body' }], isError: false,
+    meta: fetchMeta(), subCalls: [], ...over,
+  }
+}
 
 describe('webCardModel', () => {
   it('derives a search card from result metadata, projecting every source field', () => {
@@ -154,7 +166,7 @@ describe('chat row web body', () => {
 
   it('the WebRow collapses to the summary row, expanding to the full search card', () => {
     const globe = render(<IconGlobeOutlineRegular />).container.querySelector('svg')!.outerHTML
-    const view = render(<WebRow {...rowProps(settledSearch(), 'web_search')} />)
+    const view = render(<WebRow {...rowProps(settledSearch(), 'web_search')} useContextMenu={contextMenuHook()} />)
     // Collapsed: the summary row alone, no card in the DOM.
     expect(view.getByText('网页搜索')).toBeTruthy()
     expect(view.container.querySelector('svg')?.outerHTML).toBe(globe)
@@ -169,7 +181,7 @@ describe('chat row web body', () => {
   })
 
   it('the WebRow expands to the fetch card, titled Fetch', () => {
-    const view = render(<WebRow {...rowProps(settledFetch(), 'web_fetch')} />)
+    const view = render(<WebRow {...rowProps(settledFetch(), 'web_fetch')} useContextMenu={contextMenuHook()} />)
     expect(view.getByText('网页获取')).toBeTruthy()
     expect(view.container.querySelector('[data-web]')).toBeNull()
     toggleRow(view)
@@ -180,7 +192,7 @@ describe('chat row web body', () => {
   })
 
   it('the collapsed WebRow summary opens the fetch URL in a new tab without expanding', () => {
-    const view = render(<WebRow {...rowProps(settledFetch(), 'web_fetch')} />)
+    const view = render(<WebRow {...rowProps(settledFetch(), 'web_fetch')} useContextMenu={contextMenuHook()} />)
     const link = view.getByRole('link', { name: 'https://example.com/page' })
     expect(link.getAttribute('href')).toBe('https://example.com/page')
     expect(link.getAttribute('target')).toBe('_blank')
@@ -193,12 +205,12 @@ describe('chat row web body', () => {
   })
 
   it('a failed web fetch keeps its plain error summary', () => {
-    const view = render(<WebRow {...rowProps(settledFetch({ isError: true }), 'web_fetch')} />)
+    const view = render(<WebRow {...rowProps(settledFetch({ isError: true }), 'web_fetch')} useContextMenu={contextMenuHook()} />)
     expect(view.queryByRole('link')).toBeNull()
   })
 
   it('a running web call is the summary row alone, with nothing to expand', () => {
-    const view = render(<WebRow {...rowProps(runningSearch(), 'web_search')} />)
+    const view = render(<WebRow {...rowProps(runningSearch(), 'web_search')} useContextMenu={contextMenuHook()} />)
     expect(view.getByText('网页搜索')).toBeTruthy()
     expect(view.queryByText('Titled')).toBeNull()
     // No card material and no expandable body: clicking the row reveals nothing.
@@ -209,7 +221,7 @@ describe('chat row web body', () => {
   it('a failed web call keeps the summary row without the card', () => {
     const view = render(<WebRow {...rowProps(settledSearch({
       isError: true,
-    }), 'web_search')} />)
+    }), 'web_search')} useContextMenu={contextMenuHook()} />)
     expect(view.getByText('网页搜索')).toBeTruthy()
     expect(view.container.querySelector('[data-web]')).toBeNull()
     // The row reflects the error state so the summary line still reads as failed.
@@ -220,7 +232,8 @@ describe('chat row web body', () => {
   it('the GenericToolCard fallback does not promote an unknown tool from metadata alone', () => {
     const view = render(<GenericToolCard {...ownerProps(settledSearch({
       call: { name: 'fx-web', argsRaw: SEARCH_ARGS },
-    }), 'fx-web')} t={t} />)
+    }), 'fx-web')} t={t}
+    getFileTriggerProps={() => ({})} />)
     toggleRow(view)
     expect(view.container.querySelector('[data-web]')).toBeNull()
     expect(view.getByText('search text')).toBeTruthy()
@@ -230,7 +243,8 @@ describe('chat row web body', () => {
     const view = render(<GenericToolCard {...ownerProps(settledSearch({
       call: { name: 'echo', argsRaw: '{}' },
       meta: undefined,
-    }), 'echo')} t={t} />)
+    }), 'echo')} t={t}
+    getFileTriggerProps={() => ({})} />)
     expect(view.container.querySelector('[data-web]')).toBeNull()
   })
 })

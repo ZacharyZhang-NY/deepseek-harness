@@ -13,7 +13,22 @@
   min-width: 0;
 }
 
+.header {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.header[data-has-accessory] {
+  gap: 8px;
+}
+
+.header[data-has-accessory] .row {
+  flex: 0 1 auto;
+}
+
 .row {
+  flex: 1 1 auto;
   position: relative;
   overflow: hidden;
   display: flex;
@@ -28,8 +43,10 @@
   cursor: pointer;
 }
 
-.row:hover {
-  color: var(--dsw-alias-label-secondary);
+@media (hover: hover) {
+  .row:hover {
+    color: var(--dsw-alias-label-secondary);
+  }
 }
 
 .leading {
@@ -74,12 +91,14 @@ button.leading {
   transition: opacity 100ms ease;
 }
 
-.row:hover .iconIdle {
-  opacity: 0;
-}
+@media (hover: hover) {
+  .row:hover .iconIdle {
+    opacity: 0;
+  }
 
-.row:hover .chevronHover {
-  opacity: 1;
+  .row:hover .chevronHover {
+    opacity: 1;
+  }
 }
 
 .title {

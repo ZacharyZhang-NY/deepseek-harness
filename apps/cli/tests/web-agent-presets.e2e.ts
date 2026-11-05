@@ -1,6 +1,9 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-preset-registry'
+import { subagentModelSelectionProjectionDefinition } from '@deepseek-ai/dsh-tool-subagent/src/model-selection-state.ts'
 import { createRequire } from 'node:module'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -18,15 +21,15 @@ import { provideCmdline } from '@deepseek-ai/dsh-cmdline'
 import { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { dump, load } from 'js-yaml'
-import { entryListSchema } from '@deepseek-ai/cordis-plugin-include'
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { bundlePatchPaths, composeEntries } from '@deepseek-ai/dsh-app-boot'
+import { createPluginProfile } from '../../desktop/src/project-manager.ts'
 /** Profile entry ids whose volatile fields these scenarios edit through Settings. */
 const SETTINGS_NAMESPACE = 'agent-preset-registry'
 const SUBAGENT_MODEL_SELECTION_SETTINGS_NAMESPACE = 'subagent-model-selection-settings'
 import { applyChildComposition, childSessionMeta } from '@deepseek-ai/dsh-subagent'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, LlmAdapter, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-compaction-basic'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-tools'
@@ -46,6 +49,48 @@ const CLAUDE_CODE_PACKAGE_DIR = join(REPO_ROOT, 'packages/subagent/subagent-clau
 /** The installation anchor whose dependency surface the runtime resolution mirrors. */
 const INSTALL_ANCHOR = join(REPO_ROOT, 'apps/cli/package.json')
 const MINIMAL_PROMPT = 'You are a helpful software engineer assistant.'
+/** Deterministic model responses for the shipped minimal compaction path. */
+class MinimalCompactionAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'block-end', index: 0, block: {
+      type: 'text', text: options.purpose === 'compaction' ? 'Preserve the requested project task.' : 'Ready.',
+    } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+/** Emits one image read, then retains the request carrying its settled result. */
+class MinimalImageAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1_000_000 },
+      inputModalities: ['text', 'image'] })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    if (options.purpose !== undefined) {
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Image inspection' } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+    this.requests.push(options)
+    const first = this.requests.length === 1
+    yield { type: 'block-start', index: 0, blockType: first ? 'tool-call' : 'text' }
+    yield { type: 'block-end', index: 0, block: first
+      ? { type: 'tool-call', id: ToolCallId('minimal-image-read'), name: 'read_image', arguments: '{"file_path":"red.png"}' }
+      : { type: 'text', text: 'Image inspected.' } }
+    yield { type: 'finish', reason: { kind: first ? 'tool-calls' : 'stop' } }
+  }
+}
 const MINIMAL_BASH_DESCRIPTION = `Run commands in a bash shell
 * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
 * Network access depends on the task environment. Prefer configured mirrors/proxies when they are available.
@@ -64,6 +109,7 @@ async function bootWeb(
   extra: PatchOptions[] = [],
   profilePackages: readonly string[] = [],
   profileBundles?: readonly string[],
+  surface: 'web' | 'desktop' | 'spec' = 'spec',
 ): Promise<Context> {
   const storageRoot = join(profileHome, 'storages')
   const overrides: PatchOptions[] = [
@@ -74,6 +120,7 @@ async function bootWeb(
     { id: 'storage-json', config: { root: storageRoot } },
     // Fixed Session IDs must stay inside this boot's temporary profile root.
     { id: 'session-persistence-jsonl', config: { root: join(profileHome, 'sessions') } },
+    { id: 'attachment-local', config: { dshHome: profileHome } },
     // Host rows with side effects outside this process: a bound port, a served
     // asset tree, a telemetry exporter. `api-gateway` and `directory-picker`
     // stay ENABLED on purpose — the api-proxy is the host row that injects
@@ -90,10 +137,12 @@ async function bootWeb(
     // agent's capabilities, which is all this file asserts.
     { id: 'web-runtime', disabled: true },
     { id: 'session-telemetry-otel', disabled: true },
+    { id: 'desktop-product-telemetry', disabled: true },
+    { id: 'product-analytics', disabled: true },
     // A deployment-level skill on the host registry's GLOBAL layer — the same
     // registration shape a repository plugin's skill root uses. The layered
     // skills test below proves it reaches preset-composed agents.
-    { id: 'skill-badge', disabled: false },
+    { insert: [{ id: 'skill-badge', name: import.meta.resolve('@deepseek-ai/dsh-skill-badge') }] },
     { id: 'modules', disabled: true },
     // The physical Connection row owns the disabled HTTP server. bootWeb
     // supplies only its in-process registries so Host services still prove
@@ -120,9 +169,10 @@ async function bootWeb(
     ...extra,
   ]
   const home = profileHome
-  const profileDir = join(home, 'profiles', 'spec')
+  const profileDir = join(home, 'profiles', surface)
   await mkdir(profileDir, { recursive: true })
-  if (profileBundles === undefined) initProfile(profileDir, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+  if (surface === 'desktop') createPluginProfile(profileDir)
+  else if (profileBundles === undefined) initProfile(profileDir, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
   // Product Bundles are installed into the Profile, not the dsh app. Model
   // pnpm's package link for only the selected products; their own production
   // dependencies resolve from the linked workspace packages, while shared
@@ -134,7 +184,7 @@ async function bootWeb(
     await symlink(packageDir, link, 'junction')
   }
   let profile: Profile = { skippedBundles: [],
-    name: 'spec',
+    name: surface,
     dir: profileDir,
     layers: [],
     patchPath: join(profileDir, 'cordis.patch.yml'),
@@ -150,7 +200,7 @@ async function bootWeb(
       dependencies: Object.fromEntries(profileBundles.map(name => [name, 'workspace:*'])),
       dsh: { profile: { bundles: profileBundles } },
     }, null, 2) + '\n')
-    profile = loadProfile('dsh-test', 'spec', INSTALL_ANCHOR, home, { userLayer: false })
+    profile = loadProfile('dsh-test', surface, INSTALL_ANCHOR, home, { userLayer: false })
     bundlePatches = profile.layers.flatMap(layer => layer.patches)
   }
   // Deployment defaults live in a bundle beneath the profile patch, so Settings writes are not shadowed by overlays.
@@ -166,7 +216,7 @@ async function bootWeb(
   const rootConfig = join(profileDir, 'cordis.yml')
   await writeFile(rootConfig, '[]\n')
   return await boot('dsh-test', rootConfig, [...bundlePatches, ...overrides], async (bootCtx) => {
-    bootCtx.provide('profileContext', { name: 'spec', dir: profileDir, patchPath: profile.patchPath,
+    bootCtx.provide('profileContext', { name: surface, dir: profileDir, patchPath: profile.patchPath,
       installAnchor: INSTALL_ANCHOR, home, cwd: home,
       startedBundles: profileBundles ?? ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
       overlays: [], telemetryDisabledEnv: '1' })
@@ -192,27 +242,15 @@ function toolParameterNames(ctx: Context, agent: Agent, toolName: string): strin
   return Object.keys(properties).sort()
 }
 
-function enablePresetTool(composition: string, id: string): string {
-  const rows = load(composition, { schema: entryListSchema }) as import('@deepseek-ai/cordis-plugin-loader').EntryOptions[]
-  const visit = (entries: typeof rows): boolean => entries.some((row) => {
-    if (row.id === id) { row.disabled = false; return true }
-    return row.group === true && visit(row.config as typeof rows)
-  })
-  if (!visit(rows)) throw new Error(`missing preset row ${id}`)
-  return dump(rows, { schema: entryListSchema })
-}
-
 let ctx: Context
 beforeAll(async () => {
   ctx = await bootWeb(await mkdtemp(join(tmpdir(), 'dsh-web-presets-')))
 }, 120_000)
 
 describe('the shipped Web composition', () => {
-  it('leaves the global tool layer empty', () => {
-    // Every model-facing tool belongs to a preset, `ask_user_question`
-    // included: a tool in the global layer reaches EVERY agent regardless of
-    // which preset composed it, expanding that preset's tool list.
-    expect(toolNames(ctx)).toEqual([])
+  it('registers the directory and conditional Team tools in the global layer', () => {
+    // Team registrations are shared; session mode controls their step-time availability.
+    expect(toolNames(ctx)).toEqual(['team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
   })
 
   it('keeps the token meter and its context-meter projections on the host plane', async () => {
@@ -263,10 +301,11 @@ describe('the shipped Web composition', () => {
       // depend on ripgrep being present on the machine.
       expect(toolNames(ctx, handle.agent).filter(name => name !== 'glob' && name !== 'grep')).toEqual([
         'ask_user_question', 'bash', 'create_goal', 'edit', 'exit_plan_mode',
-        'get_goal', 'interrupt_agent', 'job_kill', 'job_list', 'job_output', 'list_agents', 'present', 'read', 'read_image',
+        'get_goal', 'interrupt_agent', 'job_kill', 'job_list', 'job_output', 'list_agents', 'list_subagent_models', 'plugin_manager', 'present', 'read', 'read_image',
+        'schedule_create', 'schedule_edit', 'schedule_list', 'schedule_view',
         'send_message', 'skill',
-        'subagent', 'subagent_fork', 'todo_write', 'update_goal', 'web_fetch', 'web_search',
-        'workflow', 'write',
+        'subagent', 'subagent_fork', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'todo_write', 'update_goal', 'wait_agent', 'web_fetch', 'web_search',
+        'workflow', 'working_directory', 'write',
       ])
       expect(ctx.commands.find(handle.agent, 'goal')).toBeDefined()
     } finally {
@@ -291,21 +330,72 @@ describe('the shipped Web composition', () => {
       sessionId: SessionId('preset-model-selection-enabled'),
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'standard').then(() => undefined),
     })
+    const policy = await ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
     try {
-      expect(toolNames(ctx, disabled.agent)).not.toContain('list_subagent_models')
-      expect(toolParameterNames(ctx, disabled.agent, 'subagent')).not.toEqual(expect.arrayContaining([
+      expect(toolNames(ctx, disabled.agent)).toContain('list_subagent_models')
+      expect(toolParameterNames(ctx, disabled.agent, 'subagent')).toEqual(expect.arrayContaining([
         'model', 'provider', 'reasoning_effort',
       ]))
+      expect(policy.stateOf(disabled.agent.session)).toBeNull()
+      expect(policy.stateOf(enabled.agent.session)).toEqual([
+        { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+      ])
       expect(toolNames(ctx, enabled.agent)).toContain('list_subagent_models')
       expect(toolParameterNames(ctx, enabled.agent, 'subagent')).toEqual(expect.arrayContaining([
         'model', 'provider', 'reasoning_effort',
       ]))
-      expect(toolNames(ctx, disabled.agent)).not.toContain('list_subagent_models')
+      for (const agent of [disabled.agent, enabled.agent]) {
+        expect(toolParameterNames(ctx, agent, 'subagent_fork')).toEqual(['cwd', 'description', 'name', 'prompt'])
+      }
     } finally {
+      await policy.dispose()
       await ctx.settings.update(SUBAGENT_MODEL_SELECTION_SETTINGS_NAMESPACE, { enabled: false })
       await enabled.dispose()
       await disabled.dispose()
     }
+  })
+
+  it.each(['standard', 'ptc'] as const)('retains delegation tools after repeated preset round trips ending in %s', async (target) => {
+    const adapter = new MinimalCompactionAdapter()
+    const unregister = ctx.llm.registerAdapter(['preset-round-trip'], adapter)
+    onTestFinished(unregister)
+    const direct = await ctx.agents.create({
+      sessionId: SessionId(`preset-direct-${target}-${randomUUID()}`),
+      agentOptions: { provider: 'preset-round-trip', model: 'preset-round-trip' },
+      setup: agentCtx => ctx.agentPresets.mount(agentCtx, target).then(() => undefined),
+    })
+    onTestFinished(() => direct.dispose())
+    const handle = await ctx.agents.create({
+      sessionId: SessionId(`preset-round-trip-${target}-${randomUUID()}`),
+      agentOptions: { provider: 'preset-round-trip', model: 'preset-round-trip' },
+      setup: agentCtx => ctx.agentPresets.mount(agentCtx, target).then(() => undefined),
+    })
+    onTestFinished(() => handle.dispose())
+    const { agent } = handle
+    const other = target === 'standard' ? 'ptc' : 'standard'
+    for (const preset of [other, target, other, target]) {
+      await ctx.agentPresets.select(agent, preset)
+      expect(toolNames(ctx, agent)).toEqual(expect.arrayContaining(['subagent', 'subagent_fork']))
+    }
+    expect(ctx.tools.schemas(agent)).toEqual(ctx.tools.schemas(direct.agent))
+    const assembly = await ctx.systemPrompt.assemble({ scope: agent })
+    if (target === 'ptc') {
+      const sdk = assembly.sections.find(section => section.name === 'tools:sdk')?.text ?? ''
+      expect(sdk).toContain('subagent:')
+      expect(sdk).toContain('subagent_fork:')
+    }
+    direct.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Reply with Ready.' }], source: { kind: 'user' } }))
+    await direct.agent.whenIdle()
+    const directRequest = adapter.requests.find(request => request.purpose === undefined)
+    expect(directRequest).toBeDefined()
+    adapter.requests.length = 0
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Reply with Ready.' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+    const request = adapter.requests.find(request => request.purpose === undefined)
+    expect(request).toBeDefined()
+    expect(request?.tools).toEqual(directRequest?.tools)
+    const header = agent.session.snapshotEvents().find(event => event.type === 'request/header')
+    expect(header?.data.header.tools).toEqual(request?.tools)
   })
 
   it('composes the exact RL prompt and persistent shell from `minimal`', async () => {
@@ -318,15 +408,112 @@ describe('the shipped Web composition', () => {
       expect(assembly.sections).toEqual([
         { name: 'deployment:persona-prefix', text: MINIMAL_PROMPT },
       ])
-      expect(assembly.tools.map(tool => tool.name)).toEqual(['bash'])
+      expect(assembly.tools.map(tool => tool.name)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
       expect(assembly.tools.find(tool => tool.name === 'bash')?.description).toBe(MINIMAL_BASH_DESCRIPTION)
       expect(ctx.commands.find(handle.agent, 'goal')).toBeUndefined()
       // serviceFor reports preset-owned providers; unisolated consumers inherit the host fs.
       expect(ctx.agentPresets.serviceFor(handle.agent, 'fs')).toBeUndefined()
       expect(ctx.get('fs')?.sandboxMode).toBeDefined()
       expect(handle.agent.ctx.get('fs')?.sandboxMode).toBe(ctx.get('fs')?.sandboxMode)
-      expect(ctx.agentPresets.serviceFor(handle.agent, 'compaction')).toBeUndefined()
+      expect(ctx.agentPresets.serviceFor(handle.agent, 'compaction')).toBeDefined()
       expect(handle.agent.ctx.get('compaction')).toBeUndefined()
+      expect(ctx.commands.find(handle.agent, 'compact')).toBeDefined()
+      expect(await ctx.commands.execute(handle.agent, '/compact', [], new AbortController().signal))
+        .toMatchObject({ result: { kind: 'success', text: 'No compactable history yet.' } })
+      expect(handle.agent.session.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
+    } finally {
+      await handle.dispose()
+    }
+  })
+
+  it('reads an image in minimal mode and carries its durable reference into the next request', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-minimal-image-'))
+    onTestFinished(() => rm(cwd, { recursive: true, force: true }))
+    await writeFile(join(cwd, 'red.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64'))
+    const adapter = new MinimalImageAdapter()
+    const unregister = ctx.llm.registerAdapter(['minimal-image-test'], adapter)
+    onTestFinished(unregister)
+    const handle = await ctx.agents.create({
+      sessionId: SessionId('preset-minimal-image'), meta: { cwd },
+      agentOptions: { provider: 'minimal-image-test', model: 'minimal-image-test' },
+      setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
+    })
+    try {
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect red.png.' }], source: { kind: 'user' } }))
+      await handle.agent.whenIdle()
+      expect(adapter.requests).toHaveLength(2)
+      const result = handle.agent.session.snapshotEvents().find(event => event.type === 'tool/result')
+      expect(result?.data.message.isError, JSON.stringify(result?.data.message.content)).toBe(false)
+      const image = handle.agent.session.deriveMessages().flatMap(message => message.content)
+        .find(block => block.type === 'image')
+      expect(image?.type).toBe('image')
+      if (image?.type !== 'image') throw new Error('minimal image read produced no durable image')
+      expect((await ctx.attachments.readImage(image.attachment)).data.byteLength).toBe(image.attachment.bytes)
+      expect(JSON.stringify(adapter.requests[1]?.messages)).toContain(image.attachment.attachmentId)
+      expect(adapter.requests[0]?.tools?.map(tool => tool.name)).toEqual(['bash', 'read_image', 'working_directory'])
+      expect(result?.data.meta).toMatchObject({ path: await realpath(join(cwd, 'red.png')) })
+    } finally {
+      await handle.dispose()
+    }
+  })
+
+  it('compacts minimal history through /compact and continues from the checkpoint', async () => {
+    const adapter = new MinimalCompactionAdapter()
+    const unregister = ctx.llm.registerAdapter(['minimal-compaction-test'], adapter)
+    onTestFinished(unregister)
+    const handle = await ctx.agents.create({
+      sessionId: SessionId('preset-minimal-compaction'),
+      agentOptions: { provider: 'minimal-compaction-test', model: 'minimal-compaction-test' },
+      setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
+    })
+    try {
+      handle.agent.followup(createUserMessage({
+        content: [{ type: 'text', text: 'Remember the project requirements. '.repeat(200) }], source: { kind: 'user' },
+      }))
+      await handle.agent.whenIdle()
+      const before = handle.agent.session.surface.replaceGeneration
+      const execution = await ctx.commands.execute(handle.agent, '/compact', [], new AbortController().signal)
+      expect(execution?.result.kind).toBe('success')
+      expect(handle.agent.session.surface.replaceGeneration).toBeGreaterThan(before)
+      const summary = handle.agent.session.snapshotEvents().find(event => event.type === 'compaction/summary')
+      expect(summary?.data.sourceCommandId).toBe(execution?.commandId)
+      expect(adapter.requests.filter(request => request.purpose === 'compaction')).toHaveLength(1)
+      handle.agent.followup(createUserMessage({
+        content: [{ type: 'text', text: 'Continue the project task.' }], source: { kind: 'user' },
+      }))
+      await handle.agent.whenIdle()
+      const last = adapter.requests.at(-1)
+      expect(last?.messages.flatMap(message => message.content)
+        .some(block => block.type === 'text' && block.text.includes('Preserve the requested project task.'))).toBe(true)
+      expect(toolNames(ctx, handle.agent)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
+    } finally {
+      await handle.dispose()
+    }
+  })
+
+  it('automatically compacts minimal history under context pressure', async () => {
+    const adapter = new MinimalCompactionAdapter()
+    const unregister = ctx.llm.registerAdapter(['minimal-pressure-test'], adapter)
+    onTestFinished(unregister)
+    const handle = await ctx.agents.create({
+      sessionId: SessionId('preset-minimal-pressure'),
+      agentOptions: { provider: 'minimal-pressure-test', model: 'minimal-pressure-test' },
+      setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
+    })
+    try {
+      for (let turn = 0; turn < 3; turn++) {
+        handle.agent.followup(createUserMessage({
+          content: [{ type: 'text', text: 'Remember the project requirements. '.repeat(6000) }],
+          source: { kind: 'user' },
+        }))
+        await handle.agent.whenIdle()
+      }
+      const summaries = handle.agent.session.snapshotEvents().filter(event => event.type === 'compaction/summary')
+      expect(summaries.length).toBeGreaterThan(0)
+      expect(summaries.every(event => event.data.sourceCommandId === undefined)).toBe(true)
+      expect(handle.agent.session.snapshotEvents().some(event => event.type === 'compaction/start'
+        && event.data.turn !== null)).toBe(true)
+      expect(adapter.requests.some(request => request.purpose === 'compaction')).toBe(true)
     } finally {
       await handle.dispose()
     }
@@ -342,14 +529,16 @@ describe('the shipped Web composition', () => {
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
     })
     try {
-      expect(toolNames(ctx, minimal.agent)).toEqual(['bash'])
+      expect(toolNames(ctx, minimal.agent)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
       expect(toolNames(ctx, full.agent).length).toBeGreaterThan(10)
+      expect(ctx.agentPresets.serviceFor(minimal.agent, 'compaction'))
+        .not.toBe(ctx.agentPresets.serviceFor(full.agent, 'compaction'))
 
       await minimal.dispose()
 
       // Tearing the minimal session down leaves the full one whole.
       expect(toolNames(ctx, full.agent).length).toBeGreaterThan(10)
-      expect(toolNames(ctx)).toEqual([])
+      expect(toolNames(ctx)).toEqual(['team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
     } finally {
       await full.dispose()
     }
@@ -484,7 +673,7 @@ describe('the shipped Web composition', () => {
       expect(scoped).toContain('project-proof')
 
       // The preset's own loader tool resolves the global-layer skill.
-      const loaded = await ctx.tools.execute({
+      const loaded = await executeToolFixture(ctx, {
         callId: ToolCallId('preset-skills-load'),
         name: 'skill',
         arguments: { name: 'dsh-badge' },
@@ -508,7 +697,7 @@ describe('the shipped Web composition', () => {
       // stays the preset's choice — minimal mounts no `tool-skill`, so its
       // tool table has no loader even though the global layer is readable.
       expect((await ctx.skills.list({ scope: handle.agent })).map(skill => skill.name)).toContain('dsh-badge')
-      expect(toolNames(ctx, handle.agent)).toEqual(['bash'])
+      expect(toolNames(ctx, handle.agent)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
     } finally {
       await handle.dispose()
     }
@@ -537,92 +726,110 @@ describe('the shipped Web composition', () => {
   })
 })
 
-describe('product Bundle and user-preset intersection', () => {
-  const presetIds = ['products-none', 'products-codex', 'products-claude', 'products-both'] as const
-  type Product = 'codex' | 'claude-code'
-  type PresetId = typeof presetIds[number]
+describe('preset-selected delegation through the Web Loader', () => {
+  it('exposes configured delegation tools when each preset switch resolves', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-delegation-switch-'))
+    try {
+      const configured = await bootWeb(root, loadOverlayPatches('delegation-switch',
+        join(REPO_ROOT, 'apps/cli/tests/profiles/subagent-preset-switch.overlay.yml')))
+      try {
+        const adapter = new MinimalCompactionAdapter()
+        configured.llm.registerAdapter(['preset-switch'], adapter)
+        const { agent } = await configured.agents.create({
+          sessionId: SessionId(`configured-switch-${randomUUID()}`),
+          agentOptions: { provider: 'preset-switch', model: 'preset-switch' },
+          setup: owner => configured.agentPresets.mount(owner, 'delegate-a').then(() => undefined),
+        })
+        const views: Array<{ preset: string; names: string[] }> = []
+        for (const preset of ['delegate-b', 'delegate-a', 'delegate-b', 'delegate-a', 'ptc', 'standard', 'delegate-a']) {
+          await configured.agentPresets.select(agent, preset)
+          views.push({ preset, names: toolNames(configured, agent) })
+        }
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Reply with Ready.' }], source: { kind: 'user' } }))
+        await agent.whenIdle()
+        for (const { preset, names } of views) {
+          expect(names, `tools after selecting ${preset}`).toEqual(expect.arrayContaining(['subagent', 'subagent_fork']))
+        }
+        const request = adapter.requests.find(request => request.purpose === undefined)
+        expect(request?.tools?.map(tool => tool.name)).toEqual(expect.arrayContaining(['subagent', 'subagent_fork']))
+        expect(request?.tools?.find(tool => tool.name === 'subagent'))
+          .toHaveProperty('parameters.properties.agent_preset.enum', ['standard', 'ptc', 'minimal'])
+        const header = agent.session.snapshotEvents().find(event => event.type === 'request/header')
+        expect(header?.data.header.tools).toEqual(request?.tools)
+      } finally { await configured.fiber.dispose() }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
+  })
+})
 
-  async function bootProducts(installed: readonly Product[]): Promise<Context> {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-product-presets-'))
-    const definitions: import('@deepseek-ai/cordis-plugin-loader').EntryOptions[] = []
-    const standardConfig = composeEntries([webPatches('test')]).find(row => row.id === 'preset-standard')!.config as import('@deepseek-ai/dsh-agent-preset-registry').PresetDefinition
-    const standard = dump(standardConfig.plugins, { schema: entryListSchema })
-    for (const id of presetIds) {
-      let composition = standard
-      if (id === 'products-codex' || id === 'products-both') {
-        composition = enablePresetTool(composition, 'tool-subagent-codex')
-      }
-      if (id === 'products-claude' || id === 'products-both') {
-        composition = enablePresetTool(composition, 'tool-subagent-claude-code')
-      }
-      definitions.push({ id: `preset-${id}`, name: '@deepseek-ai/dsh-agent-preset', config: { id, plugins: load(composition, { schema: entryListSchema }) } })
-    }
-    const packageDir = (product: Product): string => (
-      product === 'codex' ? CODEX_PACKAGE_DIR : CLAUDE_CODE_PACKAGE_DIR
-    )
-    const packageName = (product: Product): string => (
-      product === 'codex'
-        ? '@deepseek-ai/dsh-subagent-codex'
-        : '@deepseek-ai/dsh-subagent-claude-code'
-    )
-    return await bootWeb(root, [{ insert: definitions }], installed.map(packageDir), [
-      '@deepseek-ai/dsh-base',
-      '@deepseek-ai/dsh-web-app',
-      ...installed.map(packageName),
-    ])
+describe.each(['web', 'desktop'] as const)('%s native subagent bundles', (surface) => {
+  const products = ['codex', 'claude-code'] as const
+  type Product = typeof products[number]
+  const packageDir = (product: Product): string => (product === 'codex' ? CODEX_PACKAGE_DIR : CLAUDE_CODE_PACKAGE_DIR)
+  const toolName = (product: Product): string => `subagent_${product.replaceAll('-', '_')}`
+
+  async function bootSelected(installed: readonly Product[], extra: PatchOptions[] = []): Promise<Context> {
+    const root = await mkdtemp(join(tmpdir(), `dsh-${surface}-native-bundles-`))
+    onTestFinished(async () => { await rm(root, { recursive: true, force: true }) })
+    return await bootWeb(root, extra, installed.map(packageDir), [
+      '@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', ...installed.map(product => `@deepseek-ai/dsh-subagent-${product}`),
+    ], surface)
   }
 
-  it('composes the intersection of installed Bundles and enabled preset rows', async () => {
-    const enabledByPreset: Record<PresetId, Product[]> = {
-      'products-none': [],
-      'products-codex': ['codex'],
-      'products-claude': ['claude-code'],
-      'products-both': ['codex', 'claude-code'],
-    }
-    const scenarios: Array<{ installed: Product[]; presets: readonly PresetId[] }> = [
-      { installed: [], presets: ['products-both'] },
-      { installed: ['codex'], presets: ['products-both'] },
-      { installed: ['claude-code'], presets: ['products-both'] },
-      { installed: ['codex', 'claude-code'], presets: presetIds },
-    ]
+  async function presetTools(productCtx: Context, preset: string): Promise<string[]> {
+    const handle = await productCtx.agents.create({
+      sessionId: SessionId(`native-${surface}-${preset}-${randomUUID()}`),
+      setup: owner => productCtx.agentPresets.mount(owner, preset).then(() => undefined),
+    })
+    try {
+      return toolNames(productCtx, handle.agent).filter(name => /(?:subagent|custom)_(?:codex|claude_code)$/.test(name))
+    } finally { await handle.dispose() }
+  }
 
-    for (const { installed, presets } of scenarios) {
-      const productCtx = await bootProducts(installed)
+  it.each([[[]], [['codex']], [['claude-code']], [['codex', 'claude-code']]] as Array<[Product[]]>)(
+    'adds the selected %j delegation tools to every preset as global tools', async (installed) => {
+      const productCtx = await bootSelected(installed)
       const spawn = vi.spyOn(productCtx.subprocess, 'spawn')
       try {
-        expect(productCtx.subagents.list()
-          .filter(name => name === 'codex' || name === 'claude-code')
-          .sort())
+        expect(products.filter(name => productCtx.subagents.getProvider(name) !== undefined).sort())
           .toEqual([...installed].sort())
-        for (const id of presets) {
-          const handle = await productCtx.agents.create({
-            sessionId: SessionId(`preset-${id}-${installed.join('-') || 'none'}-${randomUUID()}`),
-            setup: agentCtx => productCtx.agentPresets.mount(agentCtx, id).then(() => undefined),
-          })
-          try {
-            const productTools = enabledByPreset[id]
-              .filter(product => installed.includes(product))
-              .map(product => product === 'codex' ? 'subagent_codex' : 'subagent_claude_code')
-              .sort()
-            const tools = toolNames(productCtx, handle.agent)
-            expect(tools.filter(name => name === 'subagent_codex' || name === 'subagent_claude_code'))
-              .toEqual(productTools)
-            expect(tools).toEqual(expect.arrayContaining(['job_kill', 'job_list', 'job_output']))
-            for (const productTool of productTools) {
-              expect(toolParameterNames(productCtx, handle.agent, productTool)).toEqual([
-                'description', 'prompt', 'run_in_background',
-              ])
-            }
-          } finally {
-            await handle.dispose()
-          }
+        const expected = installed.map(toolName).sort()
+        for (const preset of ['standard', 'cordis', 'ptc', 'minimal']) {
+          expect(await presetTools(productCtx, preset)).toEqual(expected)
         }
+        const handle = await productCtx.agents.create({
+          sessionId: SessionId(`native-${surface}-params-${randomUUID()}`),
+          setup: owner => productCtx.agentPresets.mount(owner, 'standard').then(() => undefined),
+        })
+        try {
+          for (const product of installed) {
+            expect(toolParameterNames(productCtx, handle.agent, toolName(product))).toEqual(['cwd', 'description', 'name', 'prompt'])
+          }
+        } finally { await handle.dispose() }
         expect(spawn).not.toHaveBeenCalled()
       } finally {
         spawn.mockRestore()
         await productCtx.fiber.dispose()
       }
-    }
+    }, 120_000)
+
+  it('keeps provider identities and applies later Host row overrides', async () => {
+    const providerConfig = { model: 'adoption-model', env: { DSH_NATIVE_ADOPTION: 'preserved' } }
+    const productCtx = await bootSelected(products, [
+      ...products.map(product => ({ id: `subagent-${product}`, config: providerConfig })),
+      { id: 'tool-subagent-codex', disabled: true },
+      { id: 'tool-subagent-claude-code', config: {
+        provider: 'claude-code', toolName: 'custom_claude_code', maxDepth: 'provider-managed',
+      } },
+    ])
+    try {
+      for (const product of products) {
+        expect([...productCtx.loader.entries()].find(entry => entry.options.id === `subagent-${product}`)?.options.config)
+          .toMatchObject(providerConfig)
+      }
+      for (const preset of ['standard', 'ptc', 'minimal']) {
+        expect(await presetTools(productCtx, preset)).toEqual(['custom_claude_code'])
+      }
+    } finally { await productCtx.fiber.dispose() }
   }, 120_000)
 })
 
@@ -659,7 +866,7 @@ describe('a user preset declared from the shipped cordis rows', () => {
           ]))
         }
         const signal = new AbortController().signal
-        const listed = await copyCtx.tools.execute({
+        const listed = await executeToolFixture(copyCtx, {
           callId: ToolCallId('copied-preset-inspect-list'),
           name: 'cordis_inspect_list',
           arguments: {},
@@ -674,7 +881,9 @@ describe('a user preset declared from the shipped cordis rows', () => {
         // The `Tool` provider is the one built over the host context: it
         // answers with the shared registry's view of the REQUESTING agent,
         // so the copy sees its own preset's tools, not the host's empty set.
-        const queried = await copyCtx.tools.execute({
+        const spills = vi.spyOn(copyCtx.spillStore, 'saveText')
+        onTestFinished(() => { spills.mockRestore() })
+        const queried = await executeToolFixture(copyCtx, {
           callId: ToolCallId('copied-preset-inspect-tools'),
           name: 'cordis_inspect_query',
           arguments: { platform: 'host', provider: 'Tool', method: 'listTools' },
@@ -682,21 +891,18 @@ describe('a user preset declared from the shipped cordis rows', () => {
           agent: copied.agent,
         })
         expect(queried.isError).toBe(false)
-        // The whole-table answer can pass the inline token budget once the
-        // preset's tool table grows, and the spill policy then replaces its
-        // middle with a gap plus a spill footer. What this case proves is the
-        // provider's answer, so assert the names it must carry.
-        const queriedText = resultText(queried)
+        // The tool catalog may exceed the inline budget; assert its complete stored text.
+        const queriedText = spills.mock.calls.at(-1)?.[0].content ?? resultText(queried)
         for (const toolName of ['bash', 'cordis_inspect_list', 'cordis_inspect_query', 'plugin_manager']) {
           expect(queriedText).toContain(`"name": "${toolName}"`)
         }
 
-        // The `Config` provider reads the booted profile tree: the shipped `tools` row declares a Config,
+        // The `Config` provider reads the booted profile tree: the Agent loop declares a Config,
         // and the bootstrap include row is a carrier. The name filter keeps each page small.
         type ConfigRow = { id: string; patchId: string; name: string; status: string }
         type ConfigPage = { data: { entries: ConfigRow[]; total: number; nextOffset: number | null } }
         const listConfigs = async (input: Record<string, string | number>, callId: string): Promise<ConfigPage['data']> => {
-          const page = await copyCtx.tools.execute({
+          const page = await executeToolFixture(copyCtx, {
             callId: ToolCallId(callId),
             name: 'cordis_inspect_query',
             arguments: { platform: 'host', provider: 'Config', method: 'listConfigs', input },
@@ -706,16 +912,16 @@ describe('a user preset declared from the shipped cordis rows', () => {
           expect(page.isError, resultText(page)).toBe(false)
           return (JSON.parse(resultText(page)) as ConfigPage).data
         }
-        const toolsRows = await listConfigs({ name: '@deepseek-ai/dsh-tools' }, 'copied-preset-inspect-configs')
+        const toolsRows = await listConfigs({ name: '@deepseek-ai/dsh-agent-loop' }, 'copied-preset-inspect-configs')
         const toolsRow = toolsRows.entries[0]
-        expect(toolsRow).toMatchObject({ patchId: 'tools', status: 'schema' })
+        expect(toolsRow).toMatchObject({ patchId: 'agent-loop', status: 'schema' })
         expect(toolsRows).toMatchObject({ total: 1, nextOffset: null })
         const includes = await listConfigs({ name: 'cordis:include' }, 'copied-preset-inspect-includes')
         expect(includes.entries.find(entry => entry.patchId === 'include')).toMatchObject({ status: 'tree' })
         const firstPage = await listConfigs({ limit: 5 }, 'copied-preset-inspect-page')
         expect(firstPage.entries).toHaveLength(5)
         expect(firstPage.nextOffset).toBe(5)
-        const projected = await copyCtx.tools.execute({
+        const projected = await executeToolFixture(copyCtx, {
           callId: ToolCallId('copied-preset-inspect-config'),
           name: 'cordis_inspect_query',
           arguments: { platform: 'host', provider: 'Config', method: 'listConfigs', input: { entry: toolsRow!.id } },
@@ -727,7 +933,7 @@ describe('a user preset declared from the shipped cordis rows', () => {
         const { data } = JSON.parse(resultText(projected)) as { data: Projected }
         expect(data.status).toBe('schema')
         expect(data.schema.$defs).toHaveProperty('loaderExpression')
-        expect(JSON.stringify(data.schema)).toContain('"mode"')
+        expect(JSON.stringify(data.schema)).toContain('"maxParallelToolCalls"')
       } finally {
         await copied.dispose()
         await shipped.dispose()
@@ -755,7 +961,7 @@ describe('a switch survives the session', () => {
 
       // The header keeps the creation fact; the log carries what it runs.
       expect(handle.agent.session.header.agentPreset).toBe('standard')
-      expect(ctx.sessionProjections.stateOf(handle.agent.session, 'agentPreset')).toBe('minimal')
+      expect(ctx.sessionProjections.checkpoint(handle.agent.session).agentPreset?.val).toBe('minimal')
     } finally {
       await handle.dispose()
     }
@@ -770,7 +976,8 @@ describe('a forked session', () => {
       meta: { agentPreset: 'minimal' },
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'minimal').then(() => undefined),
     })
-    const inherited = ctx.sessionProjections.stateOf(parent.agent.session, 'agentPreset') ?? undefined
+    const projection = await ctx.sessionProjections.register(agentPresetProjectionDefinition)
+    const inherited = projection.stateOf(parent.agent.session) ?? undefined
     const child = await ctx.agents.create({
       sessionId: SessionId('preset-fork-child'),
       seed: [],
@@ -796,18 +1003,19 @@ describe('a forked session', () => {
 })
 
 describe('a delegated child', () => {
-  it('runs on the composition its parent runs on', async () => {
+  it.each([false, true])('inherits preset tools with seeded=%s and refuses child scheduled tasks', async (seeded) => {
     const parent = await ctx.agents.create({
-      sessionId: SessionId('preset-child-parent'),
+      sessionId: SessionId(`preset-child-parent-${seeded}`),
       meta: { agentPreset: 'standard' },
       setup: agentCtx => ctx.agentPresets.mount(agentCtx, 'standard').then(() => undefined),
     })
     // Exactly what an in-process subagent driver's creation window does.
     const child = await parent.agent.ctx.agents.create({
-      sessionId: SessionId('preset-child'),
-      meta: childSessionMeta(parent.agent, 1, false),
+      sessionId: SessionId(`preset-child-${seeded}`),
+      meta: childSessionMeta(parent.agent, 1, seeded),
+      ...(seeded ? { seed: [], inheritedEventCount: SessionLogOffset(0) } : {}),
       setup: (agentCtx) => {
-        applyChildComposition(agentCtx, parent.agent, {})
+        return applyChildComposition(agentCtx, parent.agent, {})
       },
     })
     try {
@@ -815,6 +1023,23 @@ describe('a delegated child', () => {
       // The shipped `standard` preset is the whole coding agent; an empty
       // child here is the defect, and equality alone would not catch it.
       expect(toolNames(ctx, child.agent)).toContain('bash')
+      expect(ctx.tools.schemas(child.agent)).toEqual(ctx.tools.schemas(parent.agent))
+      const calls = [
+        ['schedule_create', {
+          title: 'Check', prompt: 'Check', rrule: 'DTSTART:20990101T010000Z\nRRULE:FREQ=DAILY;COUNT=1', target: 'this_session',
+        }],
+        ['schedule_list', {}],
+        ['schedule_view', { id: 'task-1' }],
+        ['schedule_edit', { id: 'task-1', action: 'update', title: 'Check' }],
+      ] as const
+      for (const [name, args] of calls) {
+        expect(toolNames(ctx, child.agent)).toContain(name)
+        const result = await executeToolFixture(ctx, {
+          callId: ToolCallId(`child-${name}`), signal: new AbortController().signal,
+          name, arguments: args, agent: child.agent,
+        })
+        expect(result.value).toEqual({ code: 'subagent_session', message: 'A delegated subagent cannot use scheduled tasks.' })
+      }
       expect(child.agent.session.header.agentPreset).toBe('standard')
     } finally {
       await child.dispose()
@@ -833,7 +1058,7 @@ describe('a delegated child', () => {
       sessionId: SessionId('preset-child-switch'),
       meta: childSessionMeta(parent.agent, 1, false),
       setup: (agentCtx) => {
-        applyChildComposition(agentCtx, parent.agent, {})
+        return applyChildComposition(agentCtx, parent.agent, {})
       },
     })
     try {
@@ -861,9 +1086,8 @@ describe('the default preset as a user setting', () => {
         setup: agentCtx => ctx.agentPresets.mount(agentCtx).then(() => undefined),
       })
       try {
-        // `mount()` with no id resolves the effective default. One tool, not
-        // `standard`'s catalog: the setting decided the composition.
-        expect(toolNames(ctx, handle.agent)).toEqual(['bash'])
+        // An omitted preset id resolves the stored default instead of the composed default.
+        expect(toolNames(ctx, handle.agent)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
       } finally {
         await handle.dispose()
       }
@@ -909,7 +1133,7 @@ describe('a profile patch stored before Developer tools owned preset selection',
       setup: agentCtx => legacy.agentPresets.mount(agentCtx).then(() => undefined),
     })
     try {
-      expect(toolNames(legacy, handle.agent)).toEqual(['bash'])
+      expect(toolNames(legacy, handle.agent)).toEqual(['bash', 'read_image', 'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'working_directory'])
     } finally {
       await handle.dispose()
     }
@@ -926,7 +1150,7 @@ describe('a session keeps the preset it was created with', () => {
     try {
       // The api-proxy guard reads exactly this: the header records what the
       // session runs, so naming anything else is a caller error rather than a
-      // switch. Its history was produced under `minimal`'s single tool.
+      // switch.
       expect(handle.agent.session.header.agentPreset).toBe('minimal')
     } finally {
       await handle.dispose()

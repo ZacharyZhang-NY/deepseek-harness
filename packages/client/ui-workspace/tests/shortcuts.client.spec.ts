@@ -54,14 +54,16 @@ async function bench(runtime: 'web' | 'desktop' = 'desktop', platform: ShortcutP
     startSession: vi.fn(), forkSession: vi.fn(async () => 'fork-child' as SessionId), archiveSession: vi.fn(async (_sessionId: SessionId) => {}),
   }
   const controls = createWorkspaceShortcutControls()
+  const reportForkFailure = vi.fn()
   const fiber = ctx.plugin((scoped) => {
-    installWorkspaceShortcuts(scoped, navigation, controls, (id) => { void navigation.archiveSession(id) })
+    installWorkspaceShortcuts(scoped, navigation, controls,
+      (id) => { void navigation.archiveSession(id) }, reportForkFailure)
   })
   await fiber.await()
   const select = (id: string) => { list.set({ ...list.getSnapshot(), byId: {
     [sid('a')]: row('a', id === 'a'), [sid('b')]: row('b', id === 'b'),
   } }) }
-  return { ctx, fiber, registry, commands, navigation, controls, list, directory, select, history, loadOlder, panelInfo }
+  return { ctx, fiber, registry, commands, navigation, controls, reportForkFailure, list, directory, select, history, loadOlder, panelInfo }
 }
 
 afterEach(() => { vi.restoreAllMocks() })
@@ -77,6 +79,17 @@ describe('workspace shortcut ownership', () => {
     b.controls.add()
     expect(b.controls.state.getSnapshot().addRequested).toBe(false)
   })
+  it.each([
+    ['session.new', 'KeyN'], ['session.search', 'KeyK'], ['workspace.add', 'KeyO'],
+    ['session.rename', 'KeyG'], ['session.fork', 'KeyF'], ['session.archive', 'KeyA'],
+  ])('allows %s from the drawer and blocks it behind another dialog', async (id, code) => {
+    const b = await bench('web')
+    const gesture = key(code, { alt: code !== 'KeyF', shift: code === 'KeyF' })
+    expect(b.registry.dispatch(gesture, { ...context, modal: 'settings' }, vi.fn()).status).toBe('blocked')
+    expect(b.registry.dispatch(gesture, { ...context, modal: 'sidebar' }, vi.fn()).status).toBe('handled')
+    expect(b.commands.get(id)!.modals).toContain('sidebar')
+  })
+
   it('registers six commands with Desktop and Web defaults and removes registrations with the plugin', async () => {
     const b = await bench()
     expect(b.registry.catalog.getSnapshot().map(row => row.id)).toEqual([
@@ -188,12 +201,11 @@ describe('workspace shortcut ownership', () => {
     ))
     const invoke = () => b.registry.dispatch(key('KeyF', { alt: true }), context, vi.fn())
     expect(invoke().status).toBe('handled')
-    await vi.waitFor(() => { expect(b.controls.state.getSnapshot().forkError).toMatchObject({ reason: 'unavailable' }) })
+    await vi.waitFor(() => { expect(b.reportForkFailure).toHaveBeenCalledExactlyOnceWith('unavailable') })
     expect(warning).not.toHaveBeenCalled()
-    b.controls.dismissForkError()
     b.navigation.forkSession.mockRejectedValueOnce(new Error('connection closed'))
     expect(invoke().status).toBe('handled')
-    await vi.waitFor(() => { expect(b.controls.state.getSnapshot().forkError).toMatchObject({ reason: 'failed' }) })
+    await vi.waitFor(() => { expect(b.reportForkFailure).toHaveBeenNthCalledWith(2, 'failed') })
     expect(warning).toHaveBeenCalledOnce()
     b.list.set({ ...b.list.getSnapshot(), byId: { [sid('a')]: { ...row('a', true), running: true } } })
     expect(invoke().status).toBe('handled')

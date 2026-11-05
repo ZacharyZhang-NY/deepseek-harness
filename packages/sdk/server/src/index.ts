@@ -18,8 +18,7 @@ import { HarnessSdkJsonRpcServer } from './server.ts'
 export * from './server.ts'
 
 export const name = 'sdk-jsonrpc-server'
-// Only the agent factory is required; initialize reads the optional LLM seam with ctx.get().
-export const inject = ['agents']
+export const inject = ['agents', 'workingDirectory']
 
 /** JSON-RPC deployment config plus runtime-only test hooks. */
 export interface JsonRpcConfig {
@@ -60,6 +59,9 @@ export function apply(ctx: Context, config: JsonRpcConfig): void {
   const server = new HarnessSdkJsonRpcServer(ctx, transport, {
     maxTokensAsSuccess: resolvedConfig.maxTokensAsSuccess,
   })
+  // Compositions can order Schedule after its activation handler is installed.
+  // Like the app startup marker, this carries readiness, not another control API.
+  ctx.provide('sdkSessionActivation', { ready: true })
 
   // Share one exit task so racing shutdown requests cannot dispose the root or
   // exit the process more than once.

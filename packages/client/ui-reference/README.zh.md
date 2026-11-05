@@ -39,6 +39,8 @@ Web 用户需要从同一个 `@` 补全菜单提及文件、文件夹或会话�
 
 点击输入框中的文件引用，可在右侧栏预览文件当前的内容。带引号路径中的空格会保留，路径按输入框所属 Session 解析。文件夹和 Session 引用保留原有的编辑行为。
 
+可交互文件标签从自身 Session Slot 获取 `useContextMenu`，通过文件引用注册接收路径解析能力。手势发生时按当前工作区根目录解析路径，Session 工作目录不会改变引用含义。只读展示标签不安装菜单处理器，也无需 Markdown Provider。
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -58,6 +60,8 @@ Web 用户需要从同一个 `@` 补全菜单提及文件、文件夹或会话�
 ### 序列化
 
 文件选择把共享 `@path` 语法所定义的自然文本保留为隐藏的序列化与剪贴板形式。会话选择使用规范的 `@[label](dsh-session:…)` mention；序列化永远不会根据可见标题重建身份。
+
+插件还向 [UserText](../ui-conversation/README.zh.md#sent-user-text) 注册文件和目录匹配器，并拥有它们的 `conversation.user.text.node` renderer。每次查询返回原文偏移之后的下一个完整引用，不执行文件发现；共享计算器按原文位置裁定重叠。可交互的文件节点通过 Injection 接收绑定 Session 的 `openFile`；导航失败时保留引用，提供局部重试／关闭对话框。目录节点仍为标签。
 
 </details>
 
@@ -104,5 +108,3 @@ Web 用户需要从同一个 `@` 补全菜单提及文件、文件夹或会话�
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。插件只注册一个 slash source，HMR 测试覆盖释放；它不发出 Cordis 事件，也不持有跨插件可变状态。

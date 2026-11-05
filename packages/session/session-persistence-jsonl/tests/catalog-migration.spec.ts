@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { SessionId, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { SessionFormatUnsupportedError, SessionPersistenceCorruptionError } from '@deepseek-ai/dsh-session-persistence'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -219,6 +219,21 @@ describe.each(['none', 'zstd'] as const)('historical catalog publication (%s)', 
     } }])
     const writer = await f.ctx.sessionPersistence.open(f.parent, 'write')
     await writer.close()
+  })
+
+  it.each([1, 2])('migrates a format v0 parent and child with descriptor v%i', async (version) => {
+    const f = await fixture()
+    await rm(generationLogPath(f.root, undefined, f.parent, 3, compression))
+    await f.write(f.parent, [], false, 0)
+    const data = version === 1 ? { version, provider: 'spawn', label: 'old child' }
+      : { ...f.descriptor.data, version }
+    const events = [{ ...f.descriptor, data }]
+    await f.write('child', events, true, 0)
+    expect(await f.read()).toMatchObject([{ type: 'subagent/catalog', data: {
+      childId: 'child', childCreatedAt: 2, mode: 'continuable', label: 'old child',
+    } }])
+    const child = await f.ctx.sessionPersistence.open(SessionId('child'), 'read')
+    try { expect((await child.read()).events).toEqual(events) } finally { await child.close() }
   })
 
   it.each(['missing', 'unknown', 'multiple'] as const)('publishes the parent without invented %s child discovery information', async (kind) => {

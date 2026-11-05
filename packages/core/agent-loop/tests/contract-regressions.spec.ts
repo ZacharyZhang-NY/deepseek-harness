@@ -1,30 +1,21 @@
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { type RequestMessage, createUserMessage, ToolCallId, LlmError, MessageSource, ProviderRequestId, StreamChunk  } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SessionStore, { Session, SessionEvent, SessionId, TurnEndReason, type UserMessage } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture, type PostToolDecision } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { type PostToolDecision } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import InvariantRegistry from '@deepseek-ai/dsh-invariants'
-import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
-import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'test': { kind: 'test' } & ContextFormed
   }
-}
-
-async function mountInvariants(ctx: Context): Promise<void> {
-  await ctx.plugin(InvariantRegistry)
-  await ctx.plugin(SessionInvariant)
-  await ctx.plugin(AgentInvariant)
-  await ctx.plugin(AgentLoopInvariant)
 }
 
 function driverDone(agent: Agent): Promise<void> {
@@ -40,6 +31,7 @@ async function harness(adapter: MockAdapter) {
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -461,17 +453,15 @@ describe('adapter registration, routing, and accepted-input ownership', () => {
       : undefined).toContain('has no provider/model')
     expect(turnEnd?.type === 'turn/end' && turnEnd.data.reason.kind === 'error'
       ? turnEnd.data.reason.error.message
-      : undefined).toContain('agent/request')
+      : undefined).toContain('record a model selection')
   })
 
-  it('the agent/request waterfall can supply the model for a model-less agent', async () => {
+  it('a recorded selection supplies the route before a model-less Agent starts a step', async () => {
     const adapter = new MockAdapter([textResponse('routed')])
     const ctx = await harness(adapter)
-    const agent = await ctx.agentLoop.create(SessionId('a1'), {}) // no model — router plugin decides
+    const agent = await ctx.agentLoop.create(SessionId('a1'), {})
 
-    ctx.on('agent/request', async (_payload, next) => {
-      return { ...await next(), provider: 'mock', model: 'mock' }
-    })
+    agent.model.select({ provider: 'mock', model: 'mock' })
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
@@ -589,6 +579,7 @@ describe('turn numbering continues across seeded sessions', () => {
     await ctx2.plugin(SessionProjectionRegistry)
     await ctx2.plugin(SystemPrompt)
     await ctx2.plugin(ToolRuntime)
+    await ctx2.plugin(NativeToolExecutor)
     await ctx2.plugin(AgentRegistry)
     await ctx2.plugin(AgentLoop, { agents: [] })
     ctx2.llm.registerAdapter(['mock'], second)
@@ -698,7 +689,6 @@ describe('forked tool history reaches the next model request', () => {
     ])
     const ctx = await harness(adapter)
     try {
-      await mountInvariants(ctx)
       const executions: string[] = []
       for (const name of ['first', 'second']) {
         ctx.tools.register(defineContentToolFixture({
@@ -880,21 +870,6 @@ describe('step boundary publication order', () => {
 })
 
 describe('turn and step boundary recovery', () => {
-  // The session invariant companion makes an unbalanced log fail the test.
-  async function balancedHarness(adapter: MockAdapter) {
-    const ctx = new Context()
-    await ctx.plugin(LlmRuntime)
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(SessionProjectionRegistry)
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
-    ctx.llm.registerAdapter(['mock'], adapter)
-    return ctx
-  }
-
   /** Count turn/step boundary events for balance assertions. */
   function boundaryCounts(agent: Agent) {
     const e = agent.session.snapshotEvents()
@@ -910,7 +885,7 @@ describe('turn and step boundary recovery', () => {
 
   it('a throwing step/start observer cannot change a successful turn', async () => {
     const adapter = new MockAdapter([textResponse('request completed')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-stepstart'), { provider: 'mock', model: 'mock' })
 
     // Session owns post-commit containment. The loop sees a successful append,
@@ -931,8 +906,7 @@ describe('turn and step boundary recovery', () => {
     const c = boundaryCounts(agent)
     expect(c).toMatchObject({ turnStart: 1, turnEnd: 1, stepStart: 1, stepEnd: 1, errors: 0 })
     expect(errors).toEqual([])
-    // step/end precedes turn/end (the invariants oracle would reject
-    // turn/end-while-step-open, but assert the order explicitly too).
+    // step/end precedes turn/end.
     const stepEndIdx = e.findIndex(x => x.type === 'step/end')
     const turnEndIdx = e.findIndex(x => x.type === 'turn/end')
     expect(stepEndIdx).toBeGreaterThanOrEqual(0)
@@ -941,7 +915,7 @@ describe('turn and step boundary recovery', () => {
 
   it('a pre-commit turn/start rejection leaves no durable turn state', async () => {
     const adapter = new MockAdapter([])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-turnstart-veto'), { provider: 'mock', model: 'mock' })
     let rejected = false
     ctx.on('internal/dispatch', (_mode, name, args) => {
@@ -969,7 +943,7 @@ describe('turn and step boundary recovery', () => {
 
   it('a pre-commit step/start validation failure does not invent a step boundary', async () => {
     const adapter = new MockAdapter([textResponse('never reached')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-stepstart-veto'), { provider: 'mock', model: 'mock' })
     let rejected = false
     ctx.on('internal/dispatch', (_mode, name, args) => {
@@ -996,9 +970,9 @@ describe('turn and step boundary recovery', () => {
     })
   })
 
-  it('a step/end validation failure surfaces the resulting open-step invariant', async () => {
+  it('a step/end validation failure ends the turn with that error', async () => {
     const adapter = new MockAdapter([textResponse('completed before close validation')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-stepend-veto'), { provider: 'mock', model: 'mock' })
     let rejected = false
     ctx.on('internal/dispatch', (_mode, name, args) => {
@@ -1020,14 +994,18 @@ describe('turn and step boundary recovery', () => {
     expect(adapter.requests).toHaveLength(1)
     expect(errors.map(error => error.message)).toEqual([
       'reject first step-end',
-      'invariant violated by "@deepseek-ai/dsh-session": turn/end 1 while step 1 is still open',
     ])
+    // The rejected step/end is not retried, so step 1 stays open in the
+    // durable log while the turn closes with the rejection.
     expect(boundaryCounts(agent)).toMatchObject({
       turnStart: 1,
-      turnEnd: 0,
+      turnEnd: 1,
       stepStart: 1,
       stepEnd: 0,
-      errors: 0,
+      errors: 1,
+    })
+    expect(agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')).toMatchObject({
+      data: { reason: { kind: 'error', error: { message: 'reject first step-end', code: 'UNKNOWN' } } },
     })
   })
 
@@ -1035,7 +1013,7 @@ describe('turn and step boundary recovery', () => {
     // Listener failure cannot interrupt error finalization or the next turn.
     const errorStream: StreamChunk[] = [{ type: 'finish', reason: { kind: 'error', failure: { message: 'provider 500', code: 'SERVER' } } }]
     const adapter = new MockAdapter([errorStream, textResponse('turn 2 ok')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-errorlistener'), { provider: 'mock', model: 'mock' })
 
     let threw = false
@@ -1055,8 +1033,7 @@ describe('turn and step boundary recovery', () => {
     })
     expect(threw).toBe(true)
 
-    // loop survives: a second turn runs to completion (invariants oracle would
-    // throw on its turn/start if turn 1 had been left open).
+    // loop survives: a second turn runs to completion.
     send(agent, 'again')
     await waitForIdle(ctx, agent)
     const c2 = boundaryCounts(agent)
@@ -1070,7 +1047,7 @@ describe('turn and step boundary recovery', () => {
     // the agent's fiber mid-turn aborts the in-flight step. The turn must close
     // balanced with reason disposed (no error event for a disposal).
     const adapter = new MockAdapter(['hang'])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     let agent!: Agent
     const fiber = await ctx.plugin(Object.assign(async (inner: Context) => {
       agent = await inner.agentLoop.create(SessionId('a-dispose'), { provider: 'mock', model: 'mock' })
@@ -1096,7 +1073,7 @@ describe('turn and step boundary recovery', () => {
 
   it('contains a pre-step throw after disposal inside a balanced no-step turn', async () => {
     const adapter = new MockAdapter([textResponse('never reached')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     let agent!: Agent
     const fiber = await ctx.plugin(Object.assign(async (inner: Context) => {
       agent = await inner.agentLoop.create(SessionId('a-prestep-dispose-throw'), { provider: 'mock', model: 'mock' })
@@ -1161,7 +1138,7 @@ describe('turn and step boundary recovery', () => {
 
   it('a throwing step/end observer cannot rewrite the turn outcome', async () => {
     const adapter = new MockAdapter([textResponse('all good'), textResponse('turn 2 ok')])
-    const ctx = await balancedHarness(adapter)
+    const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a-stepend-throw'), { provider: 'mock', model: 'mock' })
 
     let threw = false
@@ -1319,9 +1296,9 @@ describe('disposal and cancellation during pre-step assembly', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
     ctx.llm.registerAdapter(['mock'], adapter)
 
     // Parent-owned listener survives agent-fiber disposal.
@@ -1370,9 +1347,9 @@ describe('disposal and cancellation during pre-step assembly', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
     ctx.llm.registerAdapter(['mock'], adapter)
 
     const unlisten = ctx.on('system-prompt/assemble', async function (_assembly, _context, next) {
@@ -1421,9 +1398,9 @@ describe('disposal and cancellation during pre-step assembly', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
     ctx.llm.registerAdapter(['mock'], adapter)
 
     ctx.on('agent/pre-step', async (_payload, next) => {
@@ -1468,9 +1445,9 @@ describe('disposal and cancellation during pre-step assembly', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
     ctx.llm.registerAdapter(['mock'], adapter)
 
     ctx.on('agent/pre-step', async (_payload, next) => {
@@ -1517,9 +1494,9 @@ describe('disposal and cancellation during pre-step assembly', () => {
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await mountInvariants(ctx)
     ctx.llm.registerAdapter(['mock'], adapter)
 
     ctx.on('system-prompt/assemble', async function (_assembly, _context, next) {

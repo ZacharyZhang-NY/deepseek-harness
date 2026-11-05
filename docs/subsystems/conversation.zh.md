@@ -69,7 +69,9 @@ Group 存储在安装前校验完整提交结果：根 Group 引用与记录一�
 
 系统支持增量事件。如果生产方能以较低成本发出 whole-value checkpoint，应优先采用，因为 start 位于已加载窗口之外时它仍可直接使用。每条 delta 都必须携带稳定 id，并且按照日志 `seq` 升序回放时能够确定性地产生 State；它不能依赖只存在于实时内存中的状态。如果当前历史窗口只有 update，Assembler 会保留一个 pending Context，并在更早分页补齐 start 前不构造 State。如果产品必须在 start 尚未加载时渲染，terminal 或 checkpoint 事件就必须携带足够的完整 fallback 状态，让 Definition 能直接构造结果；不要通过扫描无关事件恢复它。
 
-实时 Assistant delta 作为 Client-only `assistant/live-chunk` event 到达。重连 baseline 会把活跃的进程内紧凑 stream 展开为相同的瞬态 event，持久 `assistant/message` 与 `assistant/attempt` event 则嵌入完整紧凑 stream 供历史回放。瞬态 event 可以初始化 Context。具名工具 delta 和后续 tool/call 可以按同一个 callId 匹配为 start；只有最早的 Match 调用 start()，后续 Match 调用 update()。历史分页不把已结束消息展开为实时 delta。消费 Assistant 输出的 Definition 在同一组 `match()` 与 `update()` 方法里处理 live chunk 与持久 settlement，其他 Definition 直接返回 `null`，无需展开 stream。
+实时 Assistant delta 作为 Client-only `assistant/live-chunk` event 到达。重连 baseline 会把活跃的进程内紧凑 stream 展开为相同的瞬态 event，持久 `assistant/message` 与 `assistant/attempt` event 则嵌入完整紧凑 stream 供历史回放。瞬态 event 可以初始化 Context。每条工具 delta 和后续 `tool/call` 都可以按同一个 callId 匹配为 start，即使名称尚未到达；只有最早的 Match 调用 `start()`，后续 Match 调用 `update()`。准备态 Tool 节点只有在名称可用后才显示。历史分页不把已结束消息展开为实时 delta。消费 Assistant 输出的 Definition 通过同一组匹配和更新接口处理 live chunk 与持久 settlement，其他 Definition 直接返回 `null`，无需展开 stream。
+
+<a id="definition-and-typed-chat-payload"></a>
 
 ## Definition 与类型化 Chat payload
 
@@ -245,15 +247,33 @@ export function apply(ctx: ClientContext): void {
 
 `match(event)` 是身份提取器，不是 fold：它只能收到当前 `SessionEventLike`，并返回 Definition 内部 id 与生命周期角色。命中后，Assembler 通过 `(kind, id)` 定位 Context；当前最早的 start 初始化 State，不论它是持久事件还是瞬态事件。后续所有 Match，包括其他 start，都调用 `update`。移除瞬态 Match 后，从剩余事件重新选择 start 并重算 State；没有剩余 start 时 State 为 undefined。两个函数都必须返回引擎随后采用的 State；推荐返回新的 immutable value，但函数原地修改后返回同一对象时，采用语义也相同。
 
+`ConversationNodeDefinitionInput` 接受上述函数，或事件类型到匹配函数的只读表。函数形式的注册接收所有事件；表形式只接收列出的类型。Registry 在注册关系变化时复制表条目并预计算有序候选 Set，不在逐事件分发时构造候选集合。替换表时先注销，再重新注册。两种形式解析后的 `ConversationNodeDefinition` 都保留可调用的 `match(event)`。
+
+match 结果带 `exclusive: true` 时，即在该 Definition 的 target 上认领这个事件。Assembler 先求出该事件的全部 match，再逐个接收，因此结果与注册顺序无关：被认领 target 上的其他 Definition 不为该事件建立 Context，该 target 的未匹配事件 fallback 也不运行；其他 target 的 Definition 与没有 target 的 Definition 照常接收。同一 target 被认领两次，或没有 target 的 Definition 发起认领，都会在分发时抛错；fallback 自身返回的认领不起作用。业务 Definition 用认领来呈现某一类消息，而同一 target 上的通用 Definition 原本也会呈现它，例如迟到的问题回答。
+
 `buildLocationData(context, scope)` 可以把 Definition 拥有的数据发布到引擎拥有的 Turn 或 Step 上。通过 declaration merging 为每个 key 指定精确 value 类型。同一 Location 内的另一个 Node 可以使用受限 slot hook（例如 `useTurnData(key)`）读取该值，无须取得 Session，也无须扫描 `snapshot.chat.nodes`。
 
 `target` 与 `buildViewNode(context)` 必须同时声明一项由 target 拥有的渲染贡献。把 `context.key` 保留为 React 侧身份，根据持久排序证据选择 `anchorSeq`，并且只返回 renderer 可以直接使用的数据。某个 target Node 一旦发布，就要继续返回同一个 key；需要暂时离开可见流时使用 `visibility: 'hidden'`，不要改为返回 `null` 撤回它。
+
+Chat Node 还通过 `groupTree` 选择所在行的位置。位置由外到内排列，站在某个位置的 Node 同时具有所有内层位置的效果。Chat 的过程分组、整轮折叠和轮次输入判断只读取这个位置；完整契约见 [group-tree.ts](../../packages/client/ui-chat/src/client/contract/group-tree.ts)。
+
+| Node 是 | 声明 |
+|---|---|
+| Step 1 认领的人的输入，所在轮次开启一个交互段 | `exchange` |
+| 所在轮次的其他输入，如之后的人的输入或触发通知；位于过程之前时是开场输入，之后出现时整个轮次保持展开 | `input` |
+| 留在整轮折叠之外的轮次通知，如错误或已完成轮次页脚 | `turn` |
+| 整轮折叠仍会隐藏的独立行，如模型重试 | `process` |
+| 并入相邻步骤组的普通过程内容 | 不声明 `groupTree` |
+
+各内置 Node 声明的位置见 [Chat 业务规则](../../packages/client/ui-chat/src/client/conversation-nodes/README.zh.md#process-grouping)。如果同一 target 的通用 Definition 也会匹配你的 Node 所呈现的事件，按上文用 `exclusive: true` 认领该事件。
 
 ## Predecessor read
 
 有些 Definition 需要另一个业务 kind 在当前位置之前的最新 State。`start` 会收到 `ConversationContextReader`；应在这里调用 `reader.previous<State>(kind)`，不要接收 Context 集合或扫描事件。Reader 返回当前 start `seq` 之前最近一个已启动 Context 的只读数据。
 
 Assembler 会记录这项依赖。如果后续 older prepend 带来了更近的前序 Context、补齐了原先未知的窗口缺口，或者前序 State 被修订，引擎会从 `start` 重新运行依赖方 Context，并按 `seq` 升序回放其 update。被查询的 Definition 仍负责把有用信息写入自身 State；Reader 不提供业务专用查询方法，也不授予修改其他 Context 的权限。
+
+<a id="window-update-paths"></a>
 
 ## Window 更新路径
 
@@ -264,6 +284,7 @@ Assembler 会记录这项依赖。如果后续 older prepend 带来了更近的�
 | open、resync 或 gap repair 时 replace | 重建已加载窗口，每条标准 event 或 packed run 对每个 Definition 匹配一次，再回放每个已有 start 的 Context | 先执行 `start`，再按逻辑 `seq` 升序执行其 update；只有 update 的 pending Context 仍没有 State |
 | prepend 一页更早历史 | 只匹配新增的更早 input，按 `(kind, id)` 合并进 Context，保留现有 keyed node，并只重放受影响的 Context 与依赖 | 新发现的 scalar start 会激活已收集的 scalar 与 packed update；Location 或前序依赖变化也可能重跑 Context |
 | append 一条实时事件 | 每个 Definition 各调用一次 `match`，按 key 查找命中的 Context，只更新该 Context | 对 start 之后的匹配事件执行一次 scalar `update` 并请求一次发布；不扫描已有 Context |
+| 增量 flush 失败 | 把已加载的完整窗口回放到新的 Context，替换每个 active view，然后抛出 `rebuilt: true` 的 `ConversationUpdateError`；重建或替换也失败时抛出 `rebuilt: false`，并在下一次 flush 重试 | 每个 Context 都像 replace 一样回放。若某个 Definition 在每次增量更新中都失败，每次发布都会回放整个窗口。立即发布通过事件源订阅者日志报告错误；animation-frame 发布在帧回调中报告错误 |
 
 注册 `D` 个 Definition 时，一条新 scalar event 或 packed run 会进行 `D` 次仅当前 input 匹配；命中后的 Context key 查询是常数时间。Definition 代码必须维持这个性质：正常 append 热路径不得遍历完整事件窗口、所有 Context、`context.matches` 或已渲染 Node 集合。累计事实放进 State，同 Turn/Step 共享信息放进 Location data，有索引的前序依赖使用 `reader.previous()`。
 
@@ -281,5 +302,6 @@ Assembler 会记录这项依赖。如果后续 older prepend 带来了更近的�
 6. keyed renderer 只消费 `node.data` 与受限 Location hook，不扫描 Session 事件窗口、Context 或 Chat Node。
 7. scalar 与 packed Assistant 历史产生相同的最终 State、timing boundary 和 target snapshot；一个 packed run 在 replace、prepend、Location replay 与 registry rebuild 中始终只保留一个 Match。
 8. 创建 target source 不执行 builder 工作；显式选择或首次订阅执行一次完整 replace，后续更新送达所有 active target，重复激活不会再次 replace。
+9. Definition 在增量 flush 中抛错后，每个 active target 都显示已加载窗口的完整重建结果，后续事件继续更新它。
 
 流式与中断处理可参考 [`packages/client/ui-chat/src/client/conversation-nodes/assistant.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/assistant.ts)，前序查询可参考 [`inbox.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/inbox.ts) 与 [`message.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/message.ts)，只发布 Turn data 而不创建自有 Node 的例子见 [`packages/client/ui-deliverables`](../../packages/client/ui-deliverables)。

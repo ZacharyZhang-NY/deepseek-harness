@@ -15,17 +15,17 @@
   en: d152484eb41ac6b4
   zh: 09388d293f9be9cb
 /deepseek-ai-dsh-llm/use-this-package:
-  en: 33738e61ce410ac0
-  zh: 363760460f4d4bed
+  en: b8fbcecd62f6cad0
+  zh: d6eb81611ef0f3c5
 /deepseek-ai-dsh-llm/use-this-package/when-to-choose-it:
   en: c3ecb5a1421f27db
   zh: 4bbd3c0e513845e1
 /deepseek-ai-dsh-llm/use-this-package/minimal-composition:
-  en: 7550d716b90fcb09
-  zh: 77891a44ee623c7a
+  en: cf221d60fb42a278
+  zh: 0ea17503495d386b
 /deepseek-ai-dsh-llm/use-this-package/what-you-can-do:
-  en: b45d7a414141734e
-  zh: a641c8ea3827cee6
+  en: dc61eb86585f6e0d
+  zh: 9c0d6b240dfd2cda
 /deepseek-ai-dsh-llm/use-this-package/failures-and-recovery:
   en: 311d8c92447b7094
   zh: 68cf5cb1c3853cc1
@@ -39,8 +39,8 @@
   en: ae1618577f4e8364
   zh: a6e8ab1563c08dfb
 /deepseek-ai-dsh-llm/understand-the-implementation/main-flow:
-  en: 6dc955a0d80f6ca0
-  zh: f81dbcaeacd8b269
+  en: c95d4947745e39bb
+  zh: ec37b969f27629e2
 /deepseek-ai-dsh-llm/understand-the-implementation/invariants:
   en: 0163a050239248e5
   zh: 885c95bedcbe2ff4
@@ -54,8 +54,8 @@
   en: a81634136baef72f
   zh: b92dda883986b0e1
 /deepseek-ai-dsh-llm/known-limitations-and-deferred-work:
-  en: d60b9121545c99ec
-  zh: 3d4434a0e427470b
+  en: ed57783be0df3110
+  zh: c0c433dd6a807b89
 /deepseek-ai-dsh-llm/known-limitations-and-deferred-work/dev-note:
   en: ecbc333b88e14d88
   zh: 77c725d92efd8646

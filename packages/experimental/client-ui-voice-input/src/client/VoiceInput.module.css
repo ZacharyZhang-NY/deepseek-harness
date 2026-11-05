@@ -2,7 +2,9 @@
 .triggerAnchor { display: inline-flex; flex: none; }
 .captureRow { display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0; min-height: 34px; }
 .roundButton { width: 32px; height: 32px; padding: 0; border-radius: 50%; corner-shape: round; flex: none; background: var(--dsw-specific-selector); }
-.roundButton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-solid); }
+@media (hover: hover) {
+  .roundButton:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-solid); }
+}
 .waveform { display: block; flex: 1; width: 0; height: 24px; min-width: 24px; color: var(--dsw-alias-label-secondary); }
 .activityMessage { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; font-size: 12px; color: var(--dsw-alias-label-secondary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .inlineAction { flex: none; }
@@ -25,7 +27,7 @@
 .stepProgress { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
 .stepProgress small { font-size: 11px; color: var(--dsw-alias-label-tertiary); overflow-wrap: anywhere; }
 .preferences { display: grid; gap: 12px; font-size: 13px; margin: 18px 0; }
-.preferences label, .sourceChoice label { display: grid; grid-template-columns: 100px minmax(120px, 280px); align-items: center; gap: 12px; }
+.deviceRow, .preferences label, .sourceChoice label { display: grid; grid-template-columns: 100px minmax(120px, 280px); align-items: center; gap: 12px; }
 .preferences select, .sourceChoice select { border: 0.5px solid var(--dsw-alias-border-l1); border-radius: 6px; padding: 6px 10px; background: transparent; color: inherit; font: inherit; }
 .sourceChoice { display: grid; gap: 6px; }
 .preferences p { margin: 0; }
@@ -37,3 +39,17 @@
 .setupEstimate dt { color: var(--dsw-alias-label-tertiary); }
 .setupEstimate dd { margin: 0; }
 .setupEstimate small { color: var(--dsw-alias-label-tertiary); font-size: 12px; }
+
+.deviceField { position: relative; display: block; min-width: 0; }
+.deviceField select { width: 100%; }
+.deviceField select.deviceSelectMeter { padding-right: 72px; }
+.deviceMeter { position: absolute; top: 50%; right: 24px; display: inline-flex; transform: translateY(-50%); pointer-events: none; }
+.deviceError { grid-column: 2; min-width: 0; color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; font-size: 12px; }
+.inputLevel { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+.inputLevel > span { width: 3px; height: 12px; border-radius: 1px; background: var(--dsw-alias-border-l1); }
+.inputLevel > span[data-active='true'] { background: var(--dsw-alias-state-success-primary); }
+@media (max-width: 480px) {
+  .deviceRow, .preferences label, .sourceChoice label { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+
+  .deviceError { grid-column: 1; }
+}

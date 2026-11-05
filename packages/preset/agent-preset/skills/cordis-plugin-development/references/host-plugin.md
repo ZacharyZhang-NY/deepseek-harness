@@ -28,21 +28,31 @@ A Host-only bundle needs no dependencies, install scripts, or build tool:
 
 ## Display metadata and icon
 
-Plugin Manager cards, bundle details, component rows, and the Settings plugin inventory read display text and an icon from the manifest without activating the plugin. Put the title and description in `locale/en.json` (other languages such as `locale/zh.json` use the same fields), and declare the icon as a top-level `icon` in `package.json`:
+Plugin Manager and Settings read `meta.title` and `meta.description` from exported locale JSON and an icon from exported resources without activating plugins. Complete this checklist before installation:
+
+- Write a recognizable title and a description of the capability in `locale/en.json` under `meta.title` and `meta.description`. Add the same fields for the user's language and other supported locales, such as `locale/zh.json`; do not leave template copy unrelated to the delivered plugin. Write English titles and other UI labels in sentence case: capitalize only the first word and proper nouns, as in `Git worktrees`.
+- Create an original icon or use artwork whose license permits redistribution, retaining any required attribution.
+- Export `./locale/*.json` and `./icon`; retain existing runtime exports. Keep the patch, locales, icon, and every runtime file in `files`, updating it whenever you add modules or assets. For a packed or published bundle, verify the actual packed file list. Local directory installation links the checkout instead, so check the files directly; `files` does not filter a linked directory.
+- Check that the icon is a valid image of the declared format and satisfies the path and size limits below. An accepted filename alone does not establish that its bytes render.
+
+For example, the locale file contains:
 
 ```json
-{ "meta": { "title": "My Decoration", "description": "Draws a badge under the composer." } }
+{ "meta": { "title": "My decoration", "description": "Draws a badge under the composer." } }
 ```
 
 ```json
 {
-  "icon": "./icon.svg",
-  "exports": { "./package.json": "./package.json", "./locale/*.json": "./locale/*.json" },
-  "files": ["locale/*.json", "icon.svg"]
+  "exports": { "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["index.js", "cordis.patch.yml", "locale/*.json", "icon.svg"]
 }
 ```
 
-`icon` is a path relative to the manifest directory; SVG, PNG, JPEG, and WebP up to 256 KiB are accepted, while absolute paths, URLs, paths outside the directory, and symlinks leaving it are rejected. Missing fields fall back to `package.json` `name` and `description` and to the panel's default artwork; malformed metadata produces a diagnostic and keeps the valid text.
+A package-root plugin may instead declare a top-level `icon` in `package.json`; it takes priority over `./icon` and is a path relative to the manifest directory. A subpath plugin such as `my-plugins/search` is not a package and never reads a `package.json`; it exports `./search/locale/*.json` and `./search/icon` instead. Icons may be SVG, PNG, JPEG, or WebP up to 256 KiB and must stay inside the package; absolute paths, URLs, and symlinks leaving it are rejected. Missing fields of a package-root plugin fall back to `package.json` `name` and `description`, and missing images use the panel's default artwork; malformed metadata produces a diagnostic and keeps the valid text.
+
+After installation, verify the intended title and description in bundle details and plugin rows, plus the rendered icons, in English and the user's locale where supplied. Check for metadata diagnostics and unintended fallbacks, and that each plugin row shows its own exported icon or, when it has none, the generic artwork. Without browser control, inspect the installed resources and report that rendered display remains unverified; do not claim visual success from installation alone.
+
+An existing plugin's metadata may remain unchanged when it still describes the requested result. A disposable test fixture or an explicitly requested metadata-free package may omit resources, but explain each omission in the delivery report. A Host-only or configuration-only bundle still has a visible inventory entry; neither is an exception by itself.
 
 ## Host plugin export forms
 
@@ -52,6 +62,19 @@ Plugin Manager cards, bundle details, component rows, and the Settings plugin in
 - A service class as the default export.
 
 Register every resource inside `apply` with `ctx.effect` or `ctx.on` and return its cleanup. A plugin that declares `Config` validates the row's `config` at activation; query `Config.listConfigs` for an installed plugin's schema before writing its `config`, and follow `$defs` references in the returned document.
+
+## Persist your own configuration
+
+Plugin code never persists configuration by reading, filtering, and rewriting the active profile's `cordis.patch.yml`, and never locates that file by walking up from the package directory. That file is not your bundle's patch: it belongs to the user and holds other plugins' `insert` rows, comments, and `!!js` expressions. To change its own configuration after `apply` returns, a plugin uses the config editor:
+
+```js
+const entry = ctx.fiber.entry
+const editor = ctx.get('configEditor')
+if (entry === undefined || editor === undefined) throw new Error('Configuration cannot be saved in this profile')
+await editor.edit(entry, current => ({ ...current, field: value }))
+```
+
+`change` returns the row's complete config. The editor keeps the rest of the file, validates the candidate, serializes the write with other profile changes, and rejects values that a higher layer overrides. Report a rejection or a missing editor to the user instead of claiming the value was saved. Editing an ordinary field restarts the plugin so `apply` rebuilds its state; a field declared `.volatile()` updates in place and is read with `config.field.get()`. Store secrets, such as a token from an in-app sign-in or binding flow, as `ctx.credentials.modifyRecord()` records, not configuration; declare `credentials` in `inject` or read it with `ctx.get('credentials')`, and see the `@deepseek-ai/dsh-credentials` README for record keys.
 
 ## Install, enable, and observe
 

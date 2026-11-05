@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { classifyPersistenceChange } from './persistence-changes.ts'
-import { canonicalizeSchema, schemaDigest, type PersistenceSchemaInventory, type SchemaNode, type SchemaProperty } from './persistence-schema-model.ts'
+import { canonicalizeSchema, encodePersistenceSnapshot, schemaDigest, type PersistenceSchemaInventory, type SchemaNode, type SchemaProperty } from './persistence-schema-model.ts'
 import { renderPersistenceReview, reviewPersistenceSchemas, runPersistenceReview } from './persistence-review.ts'
 
 function fixture(options: {
@@ -66,6 +66,7 @@ describe('persistence review', () => {
       { root: 'event:user/message', path: 'event:user/message.data.source[kind="tool-registry"]' },
     ] })
     const markdown = renderPersistenceReview(report)
+    expect(markdown).toContain('## Compatibility review requirements')
     expect(markdown).not.toContain('hooks-codex')
     expect(markdown).not.toMatch(/source\[\d+\]/u)
     for (const root of report.roots) expect(root.changes).toEqual(classifyPersistenceChange(
@@ -81,7 +82,7 @@ describe('persistence review', () => {
     const report = reviewPersistenceSchemas(fixture(), fixture({ extraKind: true, changed: true }))
     expect(report.evidence.map(item => item.kind).sort()).toEqual(['kind-added', 'type-changed'])
     expect(report.evidence.find(item => item.kind === 'type-changed')?.locations[0]?.path).toBe('event:agent/inbox/spliced.data.inserted[].source[kind="changing"].value')
-    expect(report.roots.every(root => root.changes.some(change => change.requiresVersionBump))).toBe(true)
+    expect(report.roots.every(root => root.changes.some(change => change.requiresCompatibilityReview))).toBe(true)
   })
 
   it('keeps ambiguous kind matches as additions and removals even when another arm is unchanged', () => {
@@ -115,8 +116,8 @@ describe('persistence review', () => {
     try {
       const before = join(directory, 'before.json')
       const after = join(directory, 'after.json')
-      const oldText = JSON.stringify(fixture())
-      const newText = JSON.stringify(fixture({ extraKind: true }))
+      const oldText = encodePersistenceSnapshot(fixture())
+      const newText = encodePersistenceSnapshot(fixture({ extraKind: true }))
       writeFileSync(before, oldText)
       writeFileSync(after, newText)
       const args = ['--before', before, '--after', after]

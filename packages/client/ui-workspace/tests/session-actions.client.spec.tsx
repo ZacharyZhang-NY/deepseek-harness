@@ -1,39 +1,40 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * The shipped Session row actions rendered directly with hand-built props:
- * the pin, rename, fork, and archive menu rows, the archive and pin hover
- * buttons, and the two `shell.overlay` surfaces they raise (rename dialog,
- * row notice). Every action reads its own injected hooks and calls its own
- * injected callbacks; what those callbacks do is apply.client.spec's
+ * the menu rows, hover buttons, dialogs, and global notices. Every action
+ * reads its own injected hooks and calls its own injected callbacks;
+ * what those callbacks do is apply.client.spec's
  * subject. The browser and the slot machinery stay out; the assembled
  * chain lives in rename-assembly.client.spec.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { SessionListState, SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { WorkspaceId, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
-import type { GlobalStandardProps, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import type { GlobalStandardProps, PropsLocale, PropsRenderSlots, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { allowAllAccess, bindSnapshotSelector, makeTranslate, SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
+import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
+import { registerToasts } from '../src/client/toast/register.ts'
+import { ArchiveToastEntry } from '../src/client/toast/Toast.tsx'
+import type { ArchiveToastEntryProps } from '../src/client/contract/toast.ts'
 import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type {
-  MenuOpenState, RowToast, RowToastState, SessionArchiveConfirmInjected, SessionArchiveConfirmRequest,
+  RowToast, RowToastState, SessionArchiveConfirmInjected, SessionArchiveConfirmRequest,
   SessionRenameDialogInjected, SessionRenameTarget,
 } from '../src/client/contract/slots.ts'
 import {
-  ArchiveSessionMenuItem, ArchiveSessionRowButton, SessionArchiveConfirmDialog,
+  ArchiveSessionRowButton, SessionArchiveConfirmDialog,
 } from '../src/client/session-actions/ArchiveSession.tsx'
-import { ForkSessionMenuItem } from '../src/client/session-actions/ForkSession.tsx'
-import { PinSessionMenuItem, PinSessionRowButton } from '../src/client/session-actions/PinSession.tsx'
-import { RenameSessionMenuItem, SessionRenameDialog } from '../src/client/session-actions/RenameSession.tsx'
+import { PinSessionRowButton } from '../src/client/session-actions/PinSession.tsx'
+import { SessionRenameDialog } from '../src/client/session-actions/RenameSession.tsx'
 import { RowActionToast } from '../src/client/session-actions/RowActionToast.tsx'
 import { createWorkspaceViewStore } from '../src/client/stores.ts'
 import { en, zh } from '../src/client/locales.ts'
-import { ShortcutRegistry } from '../../shortcuts/src/client/registry.ts'
-import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
 
 afterEach(cleanup)
 
@@ -78,31 +79,19 @@ const standard: GlobalStandardProps = {
   useSessionStatus: hook(noStatus),
   useSessionRetainInfo: () => undefined,
   usePanelInfo,
-  useResource,
+  useContextMenu: contextMenuHook(), useResource,
   useWorkspaces: hook(workspaces),
+  ...allowAllAccess,
 }
 
-type MenuRowProps = PropsRuntime<'sidebar.workspaces.session.menu.item'> & PropsLocale<'workspace'>
 type ActionRowProps = PropsRuntime<'sidebar.workspaces.session.row.action'> & PropsLocale<'workspace'>
 type OverlayProps = PropsRuntime<'shell.overlay'> & PropsLocale<'workspace'>
-
-/** Owner share, standard seat, locale seat, and the bound open-state hook of one menu row. */
-function menuRow(menu: MenuOpenState): MenuRowProps {
-  return { ...ROW, useMenuOpenState: () => menu, useShortcuts: hook([]), t, ...standard }
-}
 
 /** Owner share, standard seat, and locale seat of one hover button. */
 const actionRow: ActionRowProps = { ...ROW, t, ...standard }
 
 /** Standard and locale seats of a `shell.overlay` entry (no owner share). */
 const overlay: OverlayProps = { t, ...standard }
-
-/** An open menu whose setter records the entries' dismissal. */
-function openMenu() {
-  const setMenuOpen = vi.fn()
-  const state: MenuOpenState = [true, setMenuOpen]
-  return { state, setMenuOpen }
-}
 
 /** Position of a mock's `nth` call in the global call sequence (a call that never happened sorts last). */
 function callOrder(fn: { mock: { invocationCallOrder: readonly number[] } }, nth = 0): number {
@@ -118,28 +107,6 @@ describe('pin action', () => {
     unpinSession: vi.fn(),
   })
 
-  it('menu row closes the menu, then pins an unpinned Session', () => {
-    const { state, setMenuOpen } = openMenu()
-    const pin = pinShare()
-    render(<PinSessionMenuItem {...menuRow(state)} {...pin} />)
-    fireEvent.click(screen.getByRole('menuitem', { name: '置顶会话' }))
-    expect(pin.pinSession).toHaveBeenCalledWith(sid('one'))
-    expect(pin.unpinSession).not.toHaveBeenCalled()
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(pin.pinSession))
-  })
-
-  it('menu row closes the menu, then unpins a pinned Session', () => {
-    const { state, setMenuOpen } = openMenu()
-    const pin = pinShare(['one'])
-    render(<PinSessionMenuItem {...menuRow(state)} {...pin} />)
-    fireEvent.click(screen.getByRole('menuitem', { name: '取消置顶' }))
-    expect(pin.unpinSession).toHaveBeenCalledWith(sid('one'))
-    expect(pin.pinSession).not.toHaveBeenCalled()
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(pin.unpinSession))
-  })
-
   it('row button toggles the pin', () => {
     const pin = pinShare()
     const view = render(<PinSessionRowButton {...actionRow} {...pin} />)
@@ -153,48 +120,37 @@ describe('pin action', () => {
     expect(pin.pinSession).toHaveBeenCalledOnce()
   })
 
+  it('offers neither toggle while the access snapshot excludes it for this Session', () => {
+    const useSessionAccess = vi.fn((_id: SessionId, endpoint: string) => endpoint !== 'workspace/pinSession')
+    const button = render(<PinSessionRowButton {...actionRow} {...pinShare()} useSessionAccess={useSessionAccess} />)
+    expect(button.container.innerHTML).toBe('')
+    button.unmount()
+    // A pinned row asks for its unpin endpoint instead.
+    const pinned = render(<PinSessionRowButton {...actionRow} {...pinShare(['one'])} useSessionAccess={useSessionAccess} />)
+    expect(useSessionAccess).toHaveBeenLastCalledWith(sid('one'), 'workspace/unpinSession')
+    expect(pinned.getByRole('button', { name: '取消置顶' })).toBeTruthy()
+  })
+
   it('offers nothing on an archived Session', () => {
-    const { state } = openMenu()
     const pin = pinShare(['one'], ['one'])
-    const menu = render(<PinSessionMenuItem {...menuRow(state)} {...pin} />)
-    expect(menu.container.childElementCount).toBe(0)
     const button = render(<PinSessionRowButton {...actionRow} {...pin} />)
-    expect(button.container.childElementCount).toBe(0)
-    expect(screen.queryByRole('button')).toBeNull()
+    expect(button.container.innerHTML).toBe('')
   })
 })
 
 describe('archive action', () => {
-  /** The archive share over fixed membership: the bound Set hook and the two callbacks the entries call. */
   const archiveShare = (archived: readonly string[] = []) => ({
-    useArchived: hook(idSet(...archived)),
-    archiveSession: vi.fn(),
-    unarchiveSession: vi.fn(),
+    useArchived: hook(idSet(...archived)), archiveSession: vi.fn(), unarchiveSession: vi.fn(),
   })
 
-  it('menu row closes the menu, then archives', () => {
-    const { state, setMenuOpen } = openMenu()
-    const archive = archiveShare()
-    render(<ArchiveSessionMenuItem {...menuRow(state)} {...archive} />)
-    const row = screen.getByRole('menuitem', { name: '归档会话' })
-    // Archive is not destructive (log and accounting slot remain): no danger styling.
-    expect(row.className).not.toMatch(/danger/)
-    fireEvent.click(row)
-    expect(archive.archiveSession).toHaveBeenCalledWith(sid('one'))
-    expect(archive.unarchiveSession).not.toHaveBeenCalled()
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(archive.archiveSession))
-  })
-
-  it('menu row closes the menu, then restores an archived Session', () => {
-    const { state, setMenuOpen } = openMenu()
-    const archive = archiveShare(['one'])
-    render(<ArchiveSessionMenuItem {...menuRow(state)} {...archive} />)
-    fireEvent.click(screen.getByRole('menuitem', { name: '取消归档' }))
-    expect(archive.unarchiveSession).toHaveBeenCalledWith(sid('one'))
-    expect(archive.archiveSession).not.toHaveBeenCalled()
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(archive.unarchiveSession))
+  it('offers no archive button without access but checks restore separately', () => {
+    const useSessionAccess = vi.fn((_id: SessionId, endpoint: string) => endpoint !== 'workspace/archiveSession')
+    const button = render(<ArchiveSessionRowButton {...actionRow} {...archiveShare()} useSessionAccess={useSessionAccess} />)
+    expect(button.container.innerHTML).toBe('')
+    button.unmount()
+    const archived = render(<ArchiveSessionRowButton {...actionRow} {...archiveShare(['one'])} useSessionAccess={useSessionAccess} />)
+    expect(useSessionAccess).toHaveBeenLastCalledWith(sid('one'), 'workspace/unarchiveSession')
+    expect(archived.getByRole('button')).toBeTruthy()
   })
 
   it('row button archives and restores', () => {
@@ -206,28 +162,6 @@ describe('archive action', () => {
     fireEvent.click(screen.getByRole('button', { name: '取消归档' }))
     expect(archive.unarchiveSession).toHaveBeenCalledWith(sid('one'))
     expect(archive.archiveSession).toHaveBeenCalledOnce()
-  })
-})
-
-describe('fork and rename rows', () => {
-  it('fork closes the menu, then forks the Session', () => {
-    const { state, setMenuOpen } = openMenu()
-    const forkSession = vi.fn()
-    render(<ForkSessionMenuItem {...menuRow(state)} forkSession={forkSession} />)
-    fireEvent.click(screen.getByRole('menuitem', { name: '分叉会话' }))
-    expect(forkSession).toHaveBeenCalledWith(sid('one'))
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(forkSession))
-  })
-
-  it('rename closes the menu, then asks for the dialog with the row title', () => {
-    const { state, setMenuOpen } = openMenu()
-    const requestSessionRename = vi.fn()
-    render(<RenameSessionMenuItem {...menuRow(state)} requestSessionRename={requestSessionRename} />)
-    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
-    expect(requestSessionRename).toHaveBeenCalledWith(sid('one'), 'Session title')
-    expect(setMenuOpen).toHaveBeenCalledWith(false)
-    expect(callOrder(setMenuOpen)).toBeLessThan(callOrder(requestSessionRename))
   })
 })
 
@@ -488,9 +422,31 @@ declare module '@deepseek-ai/dsh-workspace/types' {
   }
 }
 
+function ToastFrame({ renderSlot }: PropsRenderSlots<'shell.overlay'>) {
+  return renderSlot('shell.overlay', {})
+}
+
 describe('RowActionToast', () => {
+  it('adds the archive filter action when the display mapping supplies no actions', () => {
+    const instance = createWorkspaceViewStore().create()
+    const dismissToast = vi.fn()
+    const showArchived = vi.fn()
+    const filter = { label: 'Show archived', onClick: showArchived }
+    const renderFactorySlot = vi.fn<ArchiveToastEntryProps['renderFactorySlot']>(() => null)
+    render(<ArchiveToastEntry {...standard} kind="archived" sessionId={ROW.sessionId} seq={1}
+      t={t} useStore={bindSnapshotSelector(instance.store)} actions={instance.actions}
+      dismissToast={dismissToast} renderFactorySlot={renderFactorySlot}
+      display={() => ({ text: 'Archived', tone: 'success' })} filterAction={() => filter} />)
+    expect(renderFactorySlot).toHaveBeenCalledWith('workspace.toast.content', {
+      text: 'Archived', tone: 'success', actions: [filter], seq: 1, onDone: dismissToast,
+    })
+  })
+
   /** The notice surface over a test-owned notice source; dismissal clears the notice the way apply does. */
-  function toastSurface(viewState: { archivedFilter?: 'default' | 'show' | 'only' } = { archivedFilter: 'default' }) {
+  async function toastSurface(
+    viewState: { archivedFilter?: 'default' | 'show' | 'only' } = { archivedFilter: 'default' },
+    translate = t,
+  ) {
     const toast = createSnapshotStore<RowToastState | null>(null)
     const instance = createWorkspaceViewStore().create()
     // A v5 snapshot hydrates without the filter key; mirror it by dropping the
@@ -502,40 +458,151 @@ describe('RowActionToast', () => {
     const dismissToast = vi.fn(() => { toast.set(null) })
     const undoArchive = vi.fn()
     const showArchived = vi.fn()
-    render(
-      <RowActionToast
-        {...overlay}
-        useToast={bindSnapshotSelector(toast)}
-        useStore={bindSnapshotSelector(view)}
-        actions={instance.actions}
-        dismissToast={dismissToast}
-        undoArchive={undoArchive}
-        showArchived={showArchived}
-      />,
-    )
+    const openForkSource = vi.fn()
+    const runtime = await SlotTestRuntime.create()
+    onTestFinished(() => runtime.dispose())
+    const locale = new LocaleRuntime(runtime.ctx)
+    locale.setLocale(translate === tEn ? 'en' : 'zh')
+    locale.register('workspace', { en, zh })
+    runtime.ctx.provide('locale', locale)
+    runtime.slots.installLocale(locale)
+    await runtime.root.declare({ 'shell.overlay': { kind: 'list', scope: 'root' } }, ToastFrame)
+    registerToasts(runtime.ctx, {
+      ...createWorkspaceViewStore(),
+      create: () => ({
+        ...instance, store: view,
+        getSnapshot: () => view.getSnapshot(),
+        subscribe: listener => view.subscribe(listener),
+      }),
+    }, {
+      undoArchive, showArchived, openForkSource,
+    })
+    runtime.slots.register({
+      name: 'shell.overlay', id: 'workspace.row-toast',
+      children: { 'workspace.toast': { kind: 'keyed', scope: 'root' } },
+      inject: () => ({ hooks: { toast }, dismissToast }),
+    }, RowActionToast)
+    runtime.renderRoot()
     let seq = 0
     const notify = (notice: RowToast): void => {
       act(() => { toast.set({ ...notice, seq: ++seq }) })
     }
-    return { dismissToast, undoArchive, showArchived, notify }
+    return { dismissToast, undoArchive, showArchived, openForkSource, notify, locale, view }
   }
 
-  it('renders nothing without a notice', () => {
-    toastSurface()
+  it('updates locale and archive actions without restarting the same notice', async () => {
+    const { notify, locale, view, dismissToast } = await toastSurface()
+    vi.useFakeTimers()
+    try {
+      notify({ kind: 'archived', sessionId: sid('one') })
+      const alert = screen.getByRole('alert')
+      act(() => { vi.advanceTimersByTime(3000) })
+      act(() => { locale.setLocale('en'); view.set({ ...view.getSnapshot(), archivedFilter: 'show' }) })
+      expect(screen.getByRole('alert')).toBe(alert)
+      expect(alert.textContent).toContain('Session archived')
+      expect(screen.queryByRole('button', { name: 'filter archived sessions' })).toBeNull()
+      act(() => { vi.advanceTimersByTime(3999) })
+      expect(dismissToast).not.toHaveBeenCalled()
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(dismissToast).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('renders nothing without a notice', async () => {
+    await toastSurface()
     expect(screen.queryByRole('alert')).toBeNull()
     expect(document.body.textContent).toBe('')
   })
 
-  it('the stopped-and-archived notice offers the same undo and filter actions under its own wording', () => {
-    const { undoArchive, notify } = toastSurface()
+  it.each([
+    ['zh', t, '请先打开原会话完成迁移，再创建分支', '打开原会话'],
+    ['en', tEn, 'Open the original session to complete migration before creating a branch.', 'Open original session'],
+  ] as const)('keeps the %s fork notice after menu unmount and opens only on its action', async (_locale, translate, message, action) => {
+    const { dismissToast, openForkSource, notify } = await toastSurface(undefined, translate)
+    const forkSession = vi.fn((sessionId: SessionId) => { notify({ kind: 'forkRequiresOpen', sessionId }) })
+    forkSession(ROW.sessionId)
+
+    expect(screen.queryByRole('menuitem')).toBeNull()
+    expect(screen.getByRole('alert').textContent).toContain(message)
+    expect(openForkSource).not.toHaveBeenCalled()
+    expect(forkSession).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    expect(dismissToast).toHaveBeenCalledOnce()
+    expect(openForkSource).toHaveBeenCalledExactlyOnceWith(sid('one'))
+    expect(callOrder(dismissToast)).toBeLessThan(callOrder(openForkSource))
+    expect(forkSession).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it.each([t, tEn])('reports clipboard success and failure through the global toast', async (translate) => {
+    const { notify } = await toastSurface(undefined, translate)
+    notify({ kind: 'sessionIdCopied' })
+    expect(screen.getByRole('alert').textContent).toBe(translate('toast.sessionIdCopied'))
+    notify({ kind: 'sessionIdCopyFailed' })
+    expect(screen.getByRole('alert').textContent).toBe(translate('toast.sessionIdCopyFailed'))
+  })
+
+  it.each([t, tEn])('replaces other notices with plain shortcut fork failures and only keeps the latest', async (translate) => {
+    const { dismissToast, notify } = await toastSurface(undefined, translate)
+    vi.useFakeTimers()
+    try {
+      notify({ kind: 'archived', sessionId: sid('one') })
+      act(() => { vi.advanceTimersByTime(1000) })
+      notify({ kind: 'shortcutForkFailed', reason: 'unavailable' })
+      const first = screen.getByRole('alert')
+      expect(first.textContent).toBe(translate('shortcut.noCompletedTurn'))
+      expect(first.querySelector('svg')).toBeNull()
+      expect(first.querySelector('button')).toBeNull()
+      act(() => { vi.advanceTimersByTime(3000) })
+      expect(screen.getByRole('alert')).toBe(first)
+      notify({ kind: 'shortcutForkFailed', reason: 'failed' })
+      const retry = screen.getByRole('alert')
+      expect(retry).not.toBe(first)
+      expect(retry.textContent).toBe(translate('shortcut.forkFailed'))
+      expect(retry.querySelector('svg')).toBeNull()
+      act(() => { vi.advanceTimersByTime(3999) })
+      expect(screen.getAllByRole('alert')).toEqual([retry])
+      expect(dismissToast).not.toHaveBeenCalled()
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(dismissToast).toHaveBeenCalledOnce()
+      expect(screen.queryByRole('alert')).toBeNull()
+
+      notify({ kind: 'shortcutForkFailed', reason: 'failed' })
+      act(() => { vi.advanceTimersByTime(1000) })
+      notify({ kind: 'sessionIdCopied' })
+      const latest = screen.getByRole('alert')
+      expect(latest.textContent).toBe(translate('toast.sessionIdCopied'))
+      act(() => { vi.advanceTimersByTime(3000) })
+      expect(screen.getAllByRole('alert')).toEqual([latest])
+      expect(dismissToast).toHaveBeenCalledOnce()
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(screen.queryByRole('alert')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the stopped-and-archived notice offers the same undo and filter actions under its own wording', async () => {
+    const { dismissToast, undoArchive, showArchived, notify } = await toastSurface()
     notify({ kind: 'stoppedAndArchived', sessionId: sid('one') })
     expect(screen.getByRole('alert').textContent).toBe('已停止并归档，可撤销或筛选已归档会话')
     fireEvent.click(screen.getByRole('button', { name: '撤销' }))
     expect(undoArchive).toHaveBeenCalledWith(sid('one'))
+    expect(callOrder(dismissToast)).toBeLessThan(callOrder(undoArchive))
+
+    notify({ kind: 'stoppedAndArchived', sessionId: sid('two') })
+    fireEvent.click(screen.getByRole('button', { name: '筛选已归档会话' }))
+    expect(dismissToast).toHaveBeenCalledTimes(2)
+    expect(showArchived).toHaveBeenCalledOnce()
+    expect(callOrder(dismissToast, 1)).toBeLessThan(callOrder(showArchived))
+    expect(undoArchive).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('the archived notice takes itself down, then undoes the archive or shows the archived rows', () => {
-    const { dismissToast, undoArchive, showArchived, notify } = toastSurface()
+  it('the archived notice takes itself down, then undoes the archive or shows the archived rows', async () => {
+    const { dismissToast, undoArchive, showArchived, notify } = await toastSurface()
     notify({ kind: 'archived', sessionId: sid('one') })
     expect(screen.getByRole('alert').textContent).toBe('会话已归档，可撤销或筛选已归档会话')
     fireEvent.click(screen.getByRole('button', { name: '撤销' }))
@@ -554,14 +621,14 @@ describe('RowActionToast', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('treats a view without a persisted filter as the hidden default and keeps the filter action', () => {
-    const { notify } = toastSurface({})
+  it('treats a view without a persisted filter as the hidden default and keeps the filter action', async () => {
+    const { notify } = await toastSurface({})
     notify({ kind: 'archived', sessionId: sid('one') })
     expect(screen.getByRole('alert').textContent).toBe('会话已归档，可撤销或筛选已归档会话')
   })
 
-  it.each(['show', 'only'] as const)('omits the filter action while the %s filter already shows archived rows', (archivedFilter) => {
-    const { notify } = toastSurface({ archivedFilter })
+  it.each(['show', 'only'] as const)('omits the filter action while the %s filter already shows archived rows', async (archivedFilter) => {
+    const { notify } = await toastSurface({ archivedFilter })
     notify({ kind: 'archived', sessionId: sid('one') })
     expect(screen.getByRole('alert').textContent).toBe('会话已归档，可撤销')
     expect(screen.queryByRole('button', { name: '筛选已归档会话' })).toBeNull()
@@ -573,10 +640,10 @@ describe('RowActionToast', () => {
     ['unpinFailed', '取消置顶失败，请稍后重试'],
     ['archivedNotOpenable', '已归档对话暂时无法查看，请取消归档后查看'],
     ['defaultWorkspaceFailed', '无法创建默认工作区，请通过“选择工作区”选择文件夹'],
-  ] as const)('shows the %s warning and takes it down when its hold ends', (kind, text) => {
+  ] as const)('shows the %s warning and takes it down when its hold ends', async (kind, text) => {
+    const { dismissToast, notify } = await toastSurface()
     vi.useFakeTimers()
     try {
-      const { dismissToast, notify } = toastSurface()
       notify({ kind })
       const alert = screen.getByRole('alert')
       expect(alert.textContent).toBe(text)
@@ -589,10 +656,10 @@ describe('RowActionToast', () => {
     }
   })
 
-  it('shows a refused creation with the Host reason and holds it as long as the archived notice', () => {
+  it('shows a refused creation with the Host reason and holds it as long as the archived notice', async () => {
+    const { dismissToast, notify } = await toastSurface()
     vi.useFakeTimers()
     try {
-      const { dismissToast, notify } = toastSurface()
       notify({ kind: 'createFailed', message: 'agent-preset/invalid: agent-presets: preset "broken" failed to mount' })
       const alert = screen.getByRole('alert')
       expect(alert.textContent).toBe('新建会话失败：agent-preset/invalid: agent-presets: preset "broken" failed to mount')
@@ -607,10 +674,10 @@ describe('RowActionToast', () => {
     }
   })
 
-  it('the archived notice holds longer than a plain notice, and a repeat restarts its hold', () => {
+  it('the archived notice holds longer than a plain notice, and a repeat restarts its hold', async () => {
+    const { dismissToast, notify } = await toastSurface()
     vi.useFakeTimers()
     try {
-      const { dismissToast, notify } = toastSurface()
       notify({ kind: 'archived', sessionId: sid('one') })
       act(() => { vi.advanceTimersByTime(4000) })
       expect(screen.getByRole('alert')).toBeTruthy()
@@ -624,34 +691,4 @@ describe('RowActionToast', () => {
       vi.useRealTimers()
     }
   })
-})
-
-it('shows effective Session shortcuts while menu clicks keep the row target', () => {
-  const shortcuts = new ShortcutRegistry('desktop', 'macos')
-  for (const [action, code] of [['rename', 'KeyR'], ['fork', 'KeyF'], ['archive', 'KeyA']] as const) {
-    shortcuts.register({ id: `session.${action}` as ShortcutCommandId, label: () => action, aliases: [],
-      defaults: {
-        'desktop:macos': { code, modifiers: ['primary', action === 'archive' ? 'shift' : 'alt'] },
-        'desktop:windows': { code, modifiers: ['primary', action === 'archive' ? 'shift' : 'alt'] },
-        'desktop:linux': { code, modifiers: ['primary', action === 'archive' ? 'shift' : 'alt'] },
-      },
-      regions: ['page'], modals: [], resolve: () => ({ status: 'pass' }) })
-  }
-  const requestSessionRename = vi.fn()
-  const forkSession = vi.fn()
-  const archiveSession = vi.fn()
-  const props = { ...menuRow([true, vi.fn()]), useShortcuts: hook(shortcuts.catalog.getSnapshot()) }
-  render(<>
-    <RenameSessionMenuItem {...props} requestSessionRename={requestSessionRename} />
-    <ForkSessionMenuItem {...props} forkSession={forkSession} />
-    <ArchiveSessionMenuItem {...props} useArchived={hook(idSet())} archiveSession={archiveSession} unarchiveSession={vi.fn()} />
-  </>)
-  expect(screen.getAllByRole('menuitem').map(item => item.getAttribute('aria-keyshortcuts')))
-    .toEqual(['Alt+Meta+R', 'Alt+Meta+F', 'Shift+Meta+A'])
-  fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
-  fireEvent.click(screen.getByRole('menuitem', { name: '分叉会话' }))
-  fireEvent.click(screen.getByRole('menuitem', { name: '归档会话' }))
-  expect(requestSessionRename).toHaveBeenCalledWith(ROW.sessionId, ROW.displayTitle)
-  expect(forkSession).toHaveBeenCalledWith(ROW.sessionId)
-  expect(archiveSession).toHaveBeenCalledWith(ROW.sessionId)
 })

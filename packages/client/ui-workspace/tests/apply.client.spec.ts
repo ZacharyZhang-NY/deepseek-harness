@@ -1,32 +1,36 @@
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { MenuRegistry } from '@deepseek-ai/dsh-client-ui-context-menu/src/client/registry.ts'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import type {
-  SessionListState, SessionReference, SessionSummary,
+  ISessions, SessionListState, SessionReference, SessionSnapshot, SessionSummary,
 } from '@deepseek-ai/dsh-api-session-controller/client'
+import { SessionForkError } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { WorkspaceId, WorkspaceSnapshot, WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
-import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
-import { RemoteError, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import type { HostObservable, PropsRenderSlots, StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
+import type { ShortcutCommand } from '@deepseek-ai/dsh-client-shortcuts/client'
+import { RemoteError, StaticRemoteAccess, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply, inject } from '@deepseek-ai/dsh-client-ui-workspace/client'
 import type { WorkspaceBrowserInjected, WorkspacePickerInjected } from '@deepseek-ai/dsh-client-ui-workspace/client'
 import {
-  type ArchiveSessionInjected, type ForkSessionInjected, menuOpenStateFactory, type PinSessionInjected,
-  type RenameSessionInjected, type RowToastInjected, type SessionArchiveConfirmInjected, type SessionRenameDialogInjected,
+  type ArchiveSessionInjected, menuOpenStateFactory, type PinSessionInjected,
+  type RowToastInjected, type SessionArchiveConfirmInjected, type SessionRenameDialogInjected,
   type WorkspaceViewStoreHandle,
 } from '../src/client/contract/slots.ts'
 import { WorkspaceBrowser } from '../src/client/rows/WorkspaceBrowser.tsx'
-import { ArchiveSessionMenuItem, ArchiveSessionRowButton, SessionArchiveConfirmDialog } from '../src/client/session-actions/ArchiveSession.tsx'
-import { ForkSessionMenuItem } from '../src/client/session-actions/ForkSession.tsx'
-import { PinSessionMenuItem, PinSessionRowButton } from '../src/client/session-actions/PinSession.tsx'
-import { RenameSessionMenuItem, SessionRenameDialog } from '../src/client/session-actions/RenameSession.tsx'
+import { ArchiveSessionRowButton, SessionArchiveConfirmDialog } from '../src/client/session-actions/ArchiveSession.tsx'
+import { PinSessionRowButton } from '../src/client/session-actions/PinSession.tsx'
+import { SessionRenameDialog } from '../src/client/session-actions/RenameSession.tsx'
 import { RowActionToast } from '../src/client/session-actions/RowActionToast.tsx'
+import type { ArchiveToastInjected, ToastDisplayInjected } from '../src/client/contract/toast.ts'
 import { WorkspacePicker } from '../src/client/WorkspacePicker.tsx'
 import { FLAT_SESSION_ORDER_KEY } from '../src/client/stores.ts'
 import { UNGROUPED_KEY } from '../src/client/tree.ts'
 import { apply as hostApply } from '../src/index.ts'
+import { SECTION_HOOK_CONTEXT, SECTION_INJECT } from './section-scroller.client.ts'
 
 const sid = (id: string) => id as SessionId
 const summary = (id: string, updatedAt: number): SessionSummary => ({
@@ -50,11 +54,28 @@ const workspaceState = (
   items, archivedSessionIds, pinnedSessionIds, state: 'idle', phase: 'ready', error: null,
 })
 
-async function bench() {
+const ALLOWED: HostObservable<boolean> = createSnapshotStore(true)
+
+async function bench(access: 'fake' | 'static' = 'fake') {
   const ctx = new Context()
-  ctx.provide('shortcuts', { register: () => () => {}, catalog: createSnapshotStore([]) })
+  const commands = new Map<string, ShortcutCommand>()
+  ctx.provide('shortcuts', {
+    register: (command: ShortcutCommand) => {
+      commands.set(command.id, command)
+      return () => { commands.delete(command.id) }
+    },
+    catalog: createSnapshotStore([]),
+  })
+  const menuRegistry = new MenuRegistry(vi.fn())
+  onTestFinished(() => { menuRegistry.dispose() })
+  ctx.provide('contextMenus', { register: menuRegistry.register.bind(menuRegistry), resolve: menuRegistry.resolve.bind(menuRegistry), active: createSnapshotStore(null), open: vi.fn(), close: vi.fn() } as never)
   ctx.provide('uiConversation', {})
   await ctx.plugin(SlotRegistry).await()
+  const accessSource = vi.fn((_kind: string, _id: string, _action: string): HostObservable<boolean> => ALLOWED)
+  const stopGuard = vi.fn()
+  const whenResourceAccess = vi.fn((): () => void => stopGuard)
+  if (access === 'static') new StaticRemoteAccess(ctx)
+  else ctx.provide('remoteAccess', { source: accessSource, whenAccess: vi.fn(() => () => {}), whenResourceAccess })
   const create = vi.fn(async (input: { name: string } | { path: string }) => ({
     workspaceId: 'ws-new' as never,
     path: 'name' in input ? `/projects/${input.name}` : input.path,
@@ -68,10 +89,23 @@ async function bench() {
     value: { items: [{ sessionId: 'session' as never, snippet: 'match' }], hasMore: false },
   }))
   const renameSession = vi.fn(async (title: string) => ({ ok: true, value: { title, seq: 1 } }))
-  const binding = vi.fn((_id: string) => ({ session: { rename: renameSession } }))
+  const history = createSnapshotStore<Pick<SessionSnapshot, 'openState' | 'subagent'>>({ openState: 'open', subagent: null })
+  const session = { rename: renameSession, getSnapshot: () => history.getSnapshot() }
+  const binding = vi.fn((_id: string) => ({ session }))
+  const retainedIds = new Map<string, number>()
+  const scope = vi.fn((id: string) => retainedIds.has(id) ? ctx : undefined)
+  const sessionOf = vi.fn((owner: Context) => owner === ctx ? session : undefined)
   const retain = vi.fn((target: string) => {
     const resolved = binding(target)
-    const release = vi.fn()
+    retainedIds.set(target, (retainedIds.get(target) ?? 0) + 1)
+    let active = true
+    const release = vi.fn(() => {
+      if (!active) return
+      active = false
+      const count = retainedIds.get(target)! - 1
+      if (count === 0) retainedIds.delete(target)
+      else retainedIds.set(target, count)
+    })
     return {
       sessionId: target,
       binding: resolved,
@@ -85,7 +119,7 @@ async function bench() {
     _options: unknown,
     operation: (reference: SessionReference) => unknown,
   ) => await operation(retain(target)))
-  const fork = vi.fn(async () => 'forked' as never)
+  const fork = vi.fn<ISessions['fork']>(async () => sid('forked'))
   const pinSession = vi.fn(async () => undefined)
   const unpinSession = vi.fn(async () => undefined)
   // The Host snapshots the injected hooks derive from and a pin's order write
@@ -117,6 +151,8 @@ async function bench() {
     search,
     searchResultLimit: 20,
     binding,
+    scope,
+    sessionOf,
     subagentAddress: vi.fn(() => undefined),
     refreshProjections: vi.fn(() => Promise.resolve()),
     fork,
@@ -132,9 +168,9 @@ async function bench() {
   locale.setLocale('zh')
   ctx.provide('locale', locale)
   return {
-    ctx, slots: ctx.get('slots') as SlotRegistry, locale, create, rename,
+    ctx, slots: ctx.get('slots') as SlotRegistry, locale, create, rename, commands, accessSource, whenResourceAccess, stopGuard,
     retain, using, selectPanel, search, renameSession, binding, fork, pickDirectory, pinSession, unpinSession,
-    workspacesSubscribe, initializeDefault,
+    workspacesSubscribe, initializeDefault, history, scope, sessionOf,
     setWorkspaces: (snapshot: WorkspaceSnapshot): void => { workspaceSnapshot = snapshot },
     setSessions: (snapshot: SessionListState): void => { sessionSnapshot = snapshot },
   }
@@ -148,10 +184,17 @@ type RowListName = typeof MENU_ITEM | typeof ROW_ACTION | 'shell.overlay'
 
 /** Declare any subset of the holes with a single root registration ('root' is a single slot); the overlay is a list. */
 function declare(slots: SlotRegistry, ...names: HoleName[]): () => void {
-  const children = Object.fromEntries(names.map(name => [
-    name, { kind: name === 'shell.overlay' ? 'list' : 'single', scope: 'root' },
+  const children = Object.fromEntries([...names, 'contextMenu.content', 'contextMenu.icon'].map(name => [
+    name, { kind: name === 'shell.overlay' ? 'list' : name.startsWith('contextMenu.') ? 'keyed' : 'single', scope: 'root',
+      ...name === 'contextMenu.icon' ? { inline: true } : {},
+      ...name === 'sidebar.workspaces' ? { inject: SECTION_INJECT } : {} },
   ]))
   return slots.register({ name: 'root', children } as never, () => null)
+}
+
+/** Own the sidebar declaration independently of the frame-wide overlay in lifecycle tests. */
+function SidebarDeclarationOwner({ renderSlot }: PropsRenderSlots<'sidebar.workspaces'>) {
+  return renderSlot('sidebar.workspaces', { wide: true, expandSidebar: () => {} }, { hookContext: SECTION_HOOK_CONTEXT })
 }
 
 /** The one entry registered under `id` in a list. */
@@ -165,6 +208,20 @@ function entry(slots: SlotRegistry, key: RowListName, id: string): StoredEntry {
 function faceOf(registration: StoredEntry): object {
   if (registration.inject === undefined) throw new Error(`entry ${String(registration.options.id)} declares no inject face`)
   return registration.inject()
+}
+
+/** Select the registered data action, preserving the same captured row owner as pointer triggers. */
+function sessionMenuActions(ctx: Context) {
+  const select = (id: string, sessionId: SessionId, displayTitle = ''): void => {
+    const menu = ctx.contextMenus.resolve({ kind: 'session', value: { sessionId, displayTitle } })
+    expect(menu.source.getSnapshot().some(item => item.id === id)).toBe(true)
+    menu.select(id)
+  }
+  return {
+    forkSession: (sessionId: SessionId) => { select('session.fork/fork', sessionId) },
+    requestSessionRename: (sessionId: SessionId, title: string) => { select('session.rename/rename', sessionId, title) },
+    copySessionId: async (sessionId: SessionId) => { select('session.id/copy', sessionId); await settled() },
+  }
 }
 
 /** The viewing-store instance the browser's declared handle hands the renderer. */
@@ -183,9 +240,40 @@ describe('ui-workspace apply', () => {
   })
 
   it('declares the services it drives', () => {
-    expect(inject).toEqual([
-      'slots', 'sessions', 'workspaces', 'locale', 'remote', 'remote.directoryPicker', 'layout', 'shortcuts',
+    expect(inject).toEqual(['contextMenus',
+      'slots', 'sessions', 'workspaces', 'locale', 'remote', 'remote.directoryPicker', 'layout', 'shortcuts', 'remoteAccess',
     ])
+  })
+
+  it('publishes the Workspace access Hook over the remoteAccess service', async () => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    const provideRoot = vi.spyOn(b.slots, 'provideRoot')
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    const keyed = provideRoot.mock.calls.map(([contribution]) => contribution.keyedHooks?.['workspaceAccess']).find(Boolean)
+    // `useWorkspaceAccess(workspaceId, action)` reads the Workspace resource's answer; a call without an action names no source.
+    expect(keyed?.('w1', 'workspace/follow')).toBe(ALLOWED)
+    expect(b.accessSource).toHaveBeenCalledWith('workspace', 'w1', 'workspace/follow')
+    expect(keyed?.('w1')).toBeUndefined()
+    // `whenAccess` follows the same Workspace resource through the service's resource form.
+    const guarded = vi.fn(() => () => {})
+    expect(b.ctx.uiWorkspace.whenAccess('w1' as WorkspaceId, 'workspace/follow', guarded)).toBe(b.stopGuard)
+    expect(b.whenResourceAccess).toHaveBeenCalledWith('workspace', 'w1', 'workspace/follow', guarded)
+  })
+
+  it('hangs Workspace-guarded effects on the calling plugin, so they leave when it unloads', async () => {
+    const b = await bench('static')
+    onTestFinished(() => b.ctx.fiber.dispose())
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    const dispose = vi.fn()
+    const caller = b.ctx.plugin({
+      inject: ['uiWorkspace'],
+      apply: (callerCtx: Context) => { callerCtx.uiWorkspace.whenAccess('w1' as WorkspaceId, 'workspace/follow', () => dispose) },
+    })
+    await caller.await()
+    expect(dispose).not.toHaveBeenCalled()
+    await caller.dispose()
+    expect(dispose).toHaveBeenCalledOnce()
   })
 
   it('reports a default Workspace creation failure through the shared notice overlay', async () => {
@@ -218,7 +306,7 @@ describe('ui-workspace apply', () => {
     await Promise.resolve()
     expect(after.slots.entries('conversation.hero.workspace')[0]!.component).toBe(WorkspacePicker)
     // The row actions follow the browser's own declaration, whenever it lands.
-    expect(after.slots.entries(MENU_ITEM)).toHaveLength(4)
+    expect(after.slots.entries(MENU_ITEM)).toHaveLength(0)
     expect(after.slots.entries(ROW_ACTION)).toHaveLength(2)
     expect(after.slots.entries('shell.overlay')).toHaveLength(3)
   })
@@ -233,15 +321,12 @@ describe('ui-workspace apply', () => {
       kind: 'list', scope: 'root', inject: { hooks: { menuOpenState: menuOpenStateFactory, shortcuts: b.ctx.shortcuts.catalog } },
     })
     expect(b.slots.spec(ROW_ACTION)).toEqual({ kind: 'list', scope: 'root' })
+    expect(b.slots.spec('sidebar.session.row.trailing')).toEqual({ kind: 'list', scope: 'root', inline: true })
+    expect(b.slots.spec('sidebar.session.row.leading')).toEqual({ kind: 'list', scope: 'root', inline: true })
 
     const rows = (key: RowListName) => b.slots.entries(key)
       .map(registration => [registration.options.id, registration.options.order, registration.component, registration.locale])
-    expect(rows(MENU_ITEM)).toEqual([
-      ['pin', 100, PinSessionMenuItem, 'workspace'],
-      ['rename', 200, RenameSessionMenuItem, 'workspace'],
-      ['fork', 300, ForkSessionMenuItem, 'workspace'],
-      ['archive', 400, ArchiveSessionMenuItem, 'workspace'],
-    ])
+    expect(rows(MENU_ITEM)).toEqual([])
     expect(rows(ROW_ACTION)).toEqual([
       ['archive', 100, ArchiveSessionRowButton, 'workspace'],
       ['pin', 200, PinSessionRowButton, 'workspace'],
@@ -249,26 +334,101 @@ describe('ui-workspace apply', () => {
     expect(rows('shell.overlay')).toEqual([
       ['workspace.session-rename', undefined, SessionRenameDialog, 'workspace'],
       ['workspace.session-archive', undefined, SessionArchiveConfirmDialog, 'workspace'],
-      ['workspace.row-toast', undefined, RowActionToast, 'workspace'],
+      ['workspace.row-toast', undefined, RowActionToast, undefined],
     ])
-    // The browser and the row toast declare the same viewing-store handle,
-    // which hands out one instance: the browser's injected callbacks write
-    // view state through it and the toast reads the archived filter from it.
-    // The row actions and the other overlay surfaces declare none.
+    // Only archive notice entries share the browser's viewing store.
     const browser = b.slots.entries('sidebar.workspaces')[0]!
     expect(browser.store).toBeDefined()
     expect(viewInstance(b.slots)).toBe(viewInstance(b.slots))
     const rowToastEntry = entry(b.slots, 'shell.overlay', 'workspace.row-toast')
-    expect(rowToastEntry.store).toBe(browser.store)
+    expect(rowToastEntry.store).toBeUndefined()
+    expect(b.slots.entries('workspace.toast').map(row => row.options.key)).toEqual([
+      'sessionIdCopied', 'sessionIdCopyFailed', 'pinFailed', 'unpinFailed', 'archivedNotOpenable',
+      'defaultWorkspaceFailed', 'shortcutForkFailed', 'createFailed', 'forkRequiresOpen', 'archived', 'stoppedAndArchived',
+    ])
+    for (const registration of b.slots.entries('workspace.toast')) {
+      expect(registration.locale).toBe('workspace')
+      expect(registration.store).toBe(['archived', 'stoppedAndArchived'].includes(String(registration.options.key)) ? browser.store : undefined)
+    }
     for (const registration of [...b.slots.entries(MENU_ITEM), ...b.slots.entries(ROW_ACTION), ...b.slots.entries('shell.overlay')]) {
       if (registration === rowToastEntry) continue
       expect(registration.store).toBeUndefined()
     }
     // Each share raises its own notices inside its callbacks.
     for (const id of ['pin', 'archive']) {
-      expect(faceOf(entry(b.slots, MENU_ITEM, id))).not.toHaveProperty('notify')
       expect(faceOf(entry(b.slots, ROW_ACTION, id))).not.toHaveProperty('notify')
     }
+  })
+
+  it.each([true, false])('copies an ID directly without loading its Session (clipboard accepted: %s)', async (accepted) => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    const action = sessionMenuActions(b.ctx)
+    const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+    const writeText = vi.fn(async () => {
+      if (!accepted) throw new Error('clipboard denied')
+    })
+    vi.stubGlobal('navigator', { clipboard: { writeText } })
+    onTestFinished(() => { vi.unstubAllGlobals() })
+    await action.copySessionId(sid('cold-session'))
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('cold-session')
+    expect(toast.hooks.toast.getSnapshot()).toMatchObject({ kind: accepted ? 'sessionIdCopied' : 'sessionIdCopyFailed' })
+    expect(b.retain).not.toHaveBeenCalled()
+    expect(b.using).not.toHaveBeenCalled()
+    expect(b.binding).not.toHaveBeenCalled()
+  })
+
+  it('publishes shortcut fork failures through the same latest-notice source as row actions', async () => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declare(b.slots, 'shell.overlay')
+    const removeBrowser = b.slots.register({
+      name: 'shell.overlay', id: 'test-sidebar-owner',
+      children: { 'sidebar.workspaces': { kind: 'single', scope: 'root', inject: SECTION_INJECT } },
+    }, SidebarDeclarationOwner)
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    b.setSessions(sessionState([{ ...summary('source', 1), retainedBy: { mainView: 1 } }]))
+    const browser = faceOf(b.slots.entries('sidebar.workspaces')[0]!) as WorkspaceBrowserInjected
+    const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    onTestFinished(() => { warning.mockRestore() })
+    const invoke = () => {
+      const resolution = b.commands.get('session.fork')!.resolve({ region: 'page', modal: null, target: null })
+      if (resolution.status !== 'handled') throw new Error('the source must be available')
+      resolution.run()
+    }
+
+    browser.notifyArchivedNotOpenable()
+    expect(toast.hooks.toast.getSnapshot()).toMatchObject({ kind: 'archivedNotOpenable' })
+    b.fork.mockRejectedValueOnce(new SessionForkError(
+      new RemoteError('session/fork-unavailable', 'no completed turn', { sessionId: sid('source') }), sid('source'),
+    ))
+    invoke()
+    await vi.waitFor(() => {
+      expect(toast.hooks.toast.getSnapshot()).toMatchObject({ kind: 'shortcutForkFailed', reason: 'unavailable' })
+    })
+    expect(b.fork).toHaveBeenCalledExactlyOnceWith({ sessionId: sid('source'), increaseTitle: true })
+    expect(warning).not.toHaveBeenCalled()
+    const unavailable = toast.hooks.toast.getSnapshot()
+    b.fork.mockRejectedValueOnce(new Error('connection closed'))
+    invoke()
+    await vi.waitFor(() => {
+      expect(toast.hooks.toast.getSnapshot()).toMatchObject({ kind: 'shortcutForkFailed', reason: 'failed' })
+    })
+    expect(toast.hooks.toast.getSnapshot()).not.toBe(unavailable)
+    expect(warning).toHaveBeenCalledExactlyOnceWith('session fork rejected:', expect.any(Error))
+    const failure = toast.hooks.toast.getSnapshot()
+    removeBrowser()
+    expect(b.slots.entries('sidebar.workspaces')).toEqual([])
+    expect(entry(b.slots, 'shell.overlay', 'workspace.row-toast').component).toBe(RowActionToast)
+    expect(toast.hooks.toast.getSnapshot()).toBe(failure)
+    browser.notifyArchivedNotOpenable()
+    expect(toast.hooks.toast.getSnapshot()).toMatchObject({ kind: 'archivedNotOpenable' })
+    toast.dismissToast()
+    expect(toast.hooks.toast.getSnapshot()).toBeNull()
+    expect(browser).not.toHaveProperty('dismissForkError')
   })
 
   it('derives the pinned and archived Sets from the Workspace snapshot, rebuilt only when it changes', async () => {
@@ -276,7 +436,7 @@ describe('ui-workspace apply', () => {
     b.setWorkspaces(workspaceState([workspace('alpha', ['one', 'two'])], [sid('two')], [sid('one')]))
     declare(b.slots, 'sidebar.workspaces')
     await b.ctx.plugin({ inject: [...inject], apply }).await()
-    const pin = faceOf(entry(b.slots, MENU_ITEM, 'pin')) as PinSessionInjected
+    const pin = faceOf(entry(b.slots, ROW_ACTION, 'pin')) as PinSessionInjected
     const pinButton = faceOf(entry(b.slots, ROW_ACTION, 'pin')) as PinSessionInjected
     const archive = faceOf(entry(b.slots, ROW_ACTION, 'archive')) as ArchiveSessionInjected
     const pinned = pin.hooks.pinned.getSnapshot()
@@ -309,7 +469,7 @@ describe('ui-workspace apply', () => {
     const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
     expect(view.getSnapshot().sessionOrderByAccount).toEqual({})
 
-    const pin = faceOf(entry(b.slots, MENU_ITEM, 'pin')) as PinSessionInjected
+    const pin = faceOf(entry(b.slots, ROW_ACTION, 'pin')) as PinSessionInjected
     pin.pinSession(sid('three'))
     expect(b.pinSession).toHaveBeenCalledWith('three')
     await vi.waitFor(() => {
@@ -374,7 +534,7 @@ describe('ui-workspace apply', () => {
       expect(toast.hooks.toast.getSnapshot()).toEqual({ kind: 'archived', sessionId: 'one', seq: 1 })
     })
     // The menu row's face is the same behavior; a restore raises no notice.
-    const archiveRow = faceOf(entry(b.slots, MENU_ITEM, 'archive')) as ArchiveSessionInjected
+    const archiveRow = faceOf(entry(b.slots, ROW_ACTION, 'archive')) as ArchiveSessionInjected
     archiveRow.unarchiveSession(sid('one'))
     expect(unarchiveSession).toHaveBeenCalledWith('one')
     await settled()
@@ -456,17 +616,19 @@ describe('ui-workspace apply', () => {
     unsubscribe()
 
     expect(view.getSnapshot().archivedFilter).toBe('default')
-    toast.showArchived()
+    const archived = b.slots.entries('workspace.toast').find(row => row.options.key === 'archived')!
+    const archiveDisplay = faceOf(archived) as ArchiveToastInjected
+    archiveDisplay.filterAction(b.locale.bind('workspace'), toast.dismissToast).onClick()
     expect(view.getSnapshot().archivedFilter).toBe('show')
 
-    toast.undoArchive(sid('one'))
+    archiveDisplay.display({ kind: 'archived', sessionId: sid('one'), seq: 1 }, b.locale.bind('workspace'), toast.dismissToast).actions![0]!.onClick()
     expect(unarchiveSession).toHaveBeenCalledWith('one')
     // A rejected undo is a console diagnostic.
     const rejection = new Error('unarchive exploded')
     unarchiveSession.mockRejectedValueOnce(rejection)
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
-      toast.undoArchive(sid('two'))
+      archiveDisplay.display({ kind: 'archived', sessionId: sid('two'), seq: 2 }, b.locale.bind('workspace'), toast.dismissToast).actions![0]!.onClick()
       await vi.waitFor(() => { expect(warn).toHaveBeenCalledWith('session unarchive rejected:', rejection) })
     } finally {
       warn.mockRestore()
@@ -481,15 +643,21 @@ describe('ui-workspace apply', () => {
 
     // Fork goes through the navigation service, which leaves the child unselected.
     const forkSession = vi.spyOn(b.ctx.uiWorkspace, 'forkSession')
-    const fork = faceOf(entry(b.slots, MENU_ITEM, 'fork')) as ForkSessionInjected
+    const fork = sessionMenuActions(b.ctx)
+    using source = b.ctx.sessions.retain(sid('session'), { source: 'controllerOperation' })
+    await source.ready
     b.retain.mockClear()
     fork.forkSession('session' as never)
     await forkSession.mock.results[0]!.value
-    expect(b.fork).toHaveBeenCalledWith({ sessionId: 'session', increaseTitle: true, onCreated: expect.any(Function) as (childId: SessionId) => void })
+    const [request] = b.fork.mock.calls[0]!
+    const { onCreated, ...payload } = request
+    expect(payload).toEqual({ sessionId: 'session', increaseTitle: true, allowMigration: false })
+    expect(onCreated).toBeTypeOf('function')
     expect(b.retain).not.toHaveBeenCalled()
+    expect(b.selectPanel).not.toHaveBeenCalled()
 
     // The rename row raises the request the dialog entry reads; settling clears it.
-    const rename = faceOf(entry(b.slots, MENU_ITEM, 'rename')) as RenameSessionInjected
+    const rename = sessionMenuActions(b.ctx)
     const dialog = faceOf(entry(b.slots, 'shell.overlay', 'workspace.session-rename')) as SessionRenameDialogInjected
     expect(dialog.hooks.renameRequest.getSnapshot()).toBeNull()
     const requested = vi.fn()
@@ -521,6 +689,152 @@ describe('ui-workspace apply', () => {
     expect(unarchiveSession).toHaveBeenCalledWith('session')
   })
 
+  it.each(['absent', 'cold', 'loading', 'error', 'closed'] as const)(
+    'forks a %s source without opening it locally', async (state) => {
+      const b = await bench()
+      onTestFinished(() => b.ctx.fiber.dispose())
+      declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+      await b.ctx.plugin({ inject: [...inject], apply }).await()
+      if (state !== 'absent') {
+        const source = b.ctx.sessions.retain(sid('source'), { source: 'controllerOperation' })
+        onTestFinished(() => { source.release() })
+        await source.ready
+        b.history.set({ openState: state === 'closed' ? 'open' : state, subagent: null })
+        if (state === 'closed') source.release()
+      }
+      b.retain.mockClear()
+      const fork = sessionMenuActions(b.ctx)
+      const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+
+      expect(() => { fork.forkSession(sid('source')) }).not.toThrow()
+      await vi.waitFor(() => { expect(b.fork).toHaveBeenCalledOnce() })
+
+      const [request] = b.fork.mock.calls[0]!
+      const { onCreated, ...payload } = request
+      expect(payload).toEqual({ sessionId: 'source', increaseTitle: true, allowMigration: false })
+      expect(onCreated).toBeTypeOf('function')
+      expect(toast.hooks.toast.getSnapshot()).toBeNull()
+      expect(b.retain).not.toHaveBeenCalled()
+      expect(b.selectPanel).not.toHaveBeenCalled()
+    },
+  )
+
+  it('offers to open a source only after the Host refuses migration and never retries the fork', async () => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    b.fork.mockRejectedValueOnce(new SessionForkError(
+      new RemoteError('session/migration-required', 'migration required', { sessionId: sid('source') }),
+      sid('source'),
+    ))
+    const fork = sessionMenuActions(b.ctx)
+    const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+
+    fork.forkSession(sid('source'))
+    await vi.waitFor(() => {
+      expect(toast.hooks.toast.getSnapshot()).toEqual({ kind: 'forkRequiresOpen', sessionId: 'source', seq: 1 })
+    })
+
+    expect(b.fork).toHaveBeenCalledOnce()
+    expect(b.retain).not.toHaveBeenCalled()
+    expect(b.selectPanel).not.toHaveBeenCalled()
+    toast.dismissToast()
+    ;(faceOf(b.slots.entries('workspace.toast').find(row => row.options.key === 'forkRequiresOpen')!) as ToastDisplayInjected<'forkRequiresOpen'>)
+      .display({ kind: 'forkRequiresOpen', sessionId: sid('source'), seq: 1 }, b.locale.bind('workspace'), toast.dismissToast).actions![0]!.onClick()
+    expect(b.retain).toHaveBeenCalledExactlyOnceWith('source', { source: 'mainView' })
+    expect(b.selectPanel).toHaveBeenCalledExactlyOnceWith(null)
+    expect(b.fork).toHaveBeenCalledOnce()
+  })
+
+  it.each(['before the notice', 'after the notice'] as const)(
+    'keeps a fork source archived %s closed when its Toast action requests opening', async (timing) => {
+      const b = await bench()
+      onTestFinished(() => b.ctx.fiber.dispose())
+      b.setSessions(sessionState([summary('source', 1)]))
+      if (timing === 'before the notice') b.setWorkspaces(workspaceState([], [sid('source')]))
+      declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+      await b.ctx.plugin({ inject: [...inject], apply }).await()
+      b.fork.mockRejectedValueOnce(new SessionForkError(
+        new RemoteError('session/migration-required', 'migration required', { sessionId: sid('source') }),
+        sid('source'),
+      ))
+      const fork = sessionMenuActions(b.ctx)
+      const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+      fork.forkSession(sid('source'))
+      await vi.waitFor(() => {
+        expect(toast.hooks.toast.getSnapshot()).toEqual({ kind: 'forkRequiresOpen', sessionId: 'source', seq: 1 })
+      })
+      if (timing === 'after the notice') b.setWorkspaces(workspaceState([], [sid('source')]))
+
+      toast.dismissToast()
+      ;(faceOf(b.slots.entries('workspace.toast').find(row => row.options.key === 'forkRequiresOpen')!) as ToastDisplayInjected<'forkRequiresOpen'>)
+        .display({ kind: 'forkRequiresOpen', sessionId: sid('source'), seq: 1 }, b.locale.bind('workspace'), toast.dismissToast).actions![0]!.onClick()
+
+      expect(toast.hooks.toast.getSnapshot()).toEqual({ kind: 'archivedNotOpenable', seq: 2 })
+      expect(b.retain).not.toHaveBeenCalled()
+      expect(b.fork).toHaveBeenCalledOnce()
+      expect(b.selectPanel).not.toHaveBeenCalled()
+    },
+  )
+
+  it('forks opened read-only subagent history without selecting its child', async () => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    using source = b.ctx.sessions.retain(sid('source'), { source: 'controllerOperation' })
+    await source.ready
+    b.history.set({ openState: 'open', subagent: {
+      address: { parentSessionId: sid('parent'), childSessionId: sid('source'), mode: 'one-shot' },
+    } })
+    b.retain.mockClear()
+    const fork = sessionMenuActions(b.ctx)
+    const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+
+    fork.forkSession(sid('source'))
+    await vi.waitFor(() => { expect(b.fork).toHaveBeenCalledOnce() })
+
+    const [request] = b.fork.mock.calls[0]!
+    const { onCreated, ...payload } = request
+    expect(payload).toEqual({ sessionId: 'source', increaseTitle: true, allowMigration: false })
+    expect(onCreated).toBeTypeOf('function')
+    expect(toast.hooks.toast.getSnapshot()).toBeNull()
+    expect(b.retain).not.toHaveBeenCalled()
+    expect(b.selectPanel).not.toHaveBeenCalled()
+  })
+
+  it.each(['ordinary', 'other-remote', 'unwrapped-migration'] as const)('keeps a fork failure silent after rejection (%s)', async (kind) => {
+    const b = await bench()
+    onTestFinished(() => b.ctx.fiber.dispose())
+    declare(b.slots, 'sidebar.workspaces', 'shell.overlay')
+    await b.ctx.plugin({ inject: [...inject], apply }).await()
+    using source = b.ctx.sessions.retain(sid('source'), { source: 'controllerOperation' })
+    await source.ready
+    b.retain.mockClear()
+    const error = kind === 'ordinary'
+      ? new Error('fork failed')
+      : kind === 'other-remote'
+        ? new SessionForkError(
+          new RemoteError('session/fork-unavailable', 'no completed turn', { sessionId: sid('source') }),
+          sid('source'),
+        )
+        : new RemoteError('session/migration-required', 'migration required', { sessionId: sid('source') })
+    b.fork.mockRejectedValueOnce(error)
+    const forkSession = vi.spyOn(b.ctx.uiWorkspace, 'forkSession')
+    const fork = sessionMenuActions(b.ctx)
+    const toast = faceOf(entry(b.slots, 'shell.overlay', 'workspace.row-toast')) as RowToastInjected
+
+    fork.forkSession(sid('source'))
+    expect(forkSession).toHaveBeenCalledOnce()
+    await expect(forkSession.mock.results[0]!.value).rejects.toBe(error)
+
+    expect(toast.hooks.toast.getSnapshot()).toBeNull()
+    expect(b.fork).toHaveBeenCalledOnce()
+    expect(b.retain).not.toHaveBeenCalled()
+    expect(b.selectPanel).not.toHaveBeenCalled()
+  })
+
   it('routes browser actions and picker creation to the services', async () => {
     const b = await bench()
     declare(b.slots, 'sidebar.workspaces', 'conversation.hero.workspace')
@@ -530,9 +844,11 @@ describe('ui-workspace apply', () => {
     const browser = faceOf(b.slots.entries('sidebar.workspaces')[0]!) as WorkspaceBrowserInjected
     // The browser share delegates to the shared Session navigation action.
     browser.startSession('ws' as never)
-    expect(startSession).toHaveBeenLastCalledWith('ws')
+    expect(startSession).toHaveBeenLastCalledWith('ws', undefined)
     browser.startSession()
-    expect(startSession).toHaveBeenLastCalledWith(undefined)
+    expect(startSession).toHaveBeenLastCalledWith(undefined, undefined)
+    browser.startSession(undefined, { clearPreviousDraft: false })
+    expect(startSession).toHaveBeenLastCalledWith(undefined, { clearPreviousDraft: false })
     browser.open('session' as never)
     expect(b.retain).toHaveBeenCalledWith('session', { source: 'mainView' })
     const signal = new AbortController().signal
@@ -596,7 +912,7 @@ describe('ui-workspace apply', () => {
     declare(b.slots, 'sidebar.workspaces', 'conversation.hero.workspace', 'conversation.empty.workspace', 'shell.overlay')
     const fiber = b.ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
-    expect(b.slots.entries(MENU_ITEM)).toHaveLength(4)
+    expect(b.slots.entries(MENU_ITEM)).toHaveLength(0)
     expect(b.slots.entries(ROW_ACTION)).toHaveLength(2)
     expect(b.slots.entries('shell.overlay')).toHaveLength(3)
     await fiber.dispose()
@@ -608,5 +924,42 @@ describe('ui-workspace apply', () => {
     expect(b.slots.entries(MENU_ITEM)).toHaveLength(0)
     expect(b.slots.entries(ROW_ACTION)).toHaveLength(0)
     expect(b.slots.entries('shell.overlay')).toHaveLength(0)
+    expect(b.slots.entries('workspace.toast')).toHaveLength(0)
+    expect(b.slots.snapshot('factory:workspace.toast.content')).toEqual([])
   })
+})
+
+it('captures Workspace menu requests, rechecks mutable access, and withdraws registrations on unload', async () => {
+  const b = await bench()
+  b.setWorkspaces(workspaceState([workspace('alpha', [])]))
+  declare(b.slots, 'sidebar.workspaces')
+  const fiber = b.ctx.plugin({ inject: [...inject], apply })
+  await fiber.await()
+  const browser = faceOf(b.slots.entries('sidebar.workspaces')[0]!) as WorkspaceBrowserInjected
+  const target = { kind: 'workspace' as const, value: { workspaceId: 'alpha' as WorkspaceId, path: '/projects/alpha', displayTitle: 'Alpha' } }
+  const menu = b.ctx.contextMenus.resolve(target)
+  await menu.ready
+  expect(menu.source.getSnapshot().map(item => item.id)).toEqual(['workspace.rename/rename', 'workspace.delete/delete'])
+  menu.select('workspace.rename/rename')
+  expect(browser.hooks.workspaceActionRequest.getSnapshot()).toEqual({ action: 'rename', workspaceId: 'alpha', displayTitle: 'Alpha', storedTitle: 'alpha' })
+  browser.settleWorkspaceAction()
+  const removed = b.ctx.contextMenus.resolve(target)
+  await removed.ready
+  b.setWorkspaces(workspaceState([]))
+  removed.select('workspace.delete/delete')
+  expect(browser.hooks.workspaceActionRequest.getSnapshot()).toBeNull()
+  b.setWorkspaces(workspaceState([workspace('alpha', [])]))
+  const denied = b.ctx.contextMenus.resolve(target)
+  await denied.ready
+  b.accessSource.mockReturnValueOnce(createSnapshotStore(false))
+  denied.select('workspace.delete/delete')
+  expect(browser.hooks.workspaceActionRequest.getSnapshot()).toBeNull()
+  const deletion = b.ctx.contextMenus.resolve(target)
+  await deletion.ready
+  deletion.select('workspace.delete/delete')
+  expect(browser.hooks.workspaceActionRequest.getSnapshot()?.action).toBe('delete')
+  const pending = b.ctx.contextMenus.resolve(target)
+  await pending.ready
+  await fiber.dispose()
+  expect(pending.source.getSnapshot()).toEqual([])
 })

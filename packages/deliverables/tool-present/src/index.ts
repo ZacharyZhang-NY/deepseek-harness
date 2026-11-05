@@ -1,10 +1,10 @@
 /** Scoped tool that declares filesystem deliveries in their owning Session. */
+import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import { defineTool, type ToolExecution } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-session-projection'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { PresentedFile } from './types.ts'
 
@@ -23,7 +23,7 @@ export const Config: z<Config> = z.object({
 })
 
 /** Services used by the scoped delivery tool. */
-export const inject = ['tools', 'fs', 'sessionProjections']
+export const inject = ['tools', 'fs', 'agents', 'workingDirectory']
 
 /**
  * Register present with durable file references in its tool result.
@@ -38,6 +38,8 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'present',
     description: 'Declare existing files as final deliverables for the user. '
+      + 'Hosts may show presented files only after your turn ends, so call it once the files are final. '
+      + 'If the user needs to review files earlier, such as before a tool call that waits for their answer, link them in your message instead. '
       + 'Use it when the user needs a separate file, especially Office documents, spreadsheets, and slide decks; '
       + 'prefer your final response when that suffices. The user opens the current files; their contents are not copied.',
     parameters: {
@@ -75,11 +77,10 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(args, exec) {
       if (exec.agent === undefined) throw new Error('present requires an agent Session')
-      const boundary = ctx.sessionProjections.stateOf(exec.agent.session, 'turnBoundary')
-      if (boundary === undefined || boundary.openTurnStartSeq === null) throw new Error('present requires an open turn')
+      const boundary = ctx.agents.turnBoundaryOf(exec.agent.session)
+      if (boundary.openTurnStartSeq === null) throw new Error('present requires an open turn')
       if (args.files.length === 0 || args.files.length > config.maxFiles) throw new Error(`present accepts 1 to ${config.maxFiles} files`)
-      const cwd = exec.agent.session.header.cwd
-      if (cwd === undefined) throw new Error('present requires a workspace')
+      const cwd = await ctx.workingDirectory.ensure(exec.agent, exec.signal)
       const options = { cwd, signal: exec.signal }
       const files: PresentedFile[] = []
       for (const file of args.files) {
@@ -90,7 +91,7 @@ export function apply(ctx: Context, config: Config): void {
         const info = await ctx.fs.stat(target, exec.signal)
         if (info === undefined) throw new FsError(`Cannot present ${file.path}: file not found. Check the path, create the file if needed, and retry.`, 'FS_NOT_FOUND')
         if (info.type !== 'file') throw new Error(`Cannot present ${file.path}: not a regular file`)
-        files.push({ ...file })
+        files.push({ ...file, path: ctx.fs.processPath(target) })
       }
       exec.signal.throwIfAborted()
       pending.set(exec, { session: exec.agent.session, turn: boundary.lastTurn, files })

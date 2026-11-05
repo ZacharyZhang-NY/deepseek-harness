@@ -5,7 +5,9 @@ import type { TokenSpan } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { TranscriptionRequest } from '@deepseek-ai/dsh-experimental-api-speech-to-text/types'
 import type { SpeechPreparationOptions, SpeechProviderId, SpeechSelection, SpeechSelectionPatch, Transcript } from '@deepseek-ai/dsh-experimental-speech-to-text/types'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import { RecordingError, audioBase64, type Recording } from './audio.ts'
+import { audioBase64, type Recording } from './audio.ts'
+import { failureText } from './failure-text.ts'
+import type { MicrophoneDevice } from './microphone-device.ts'
 import type { SpeechReadiness } from './readiness.ts'
 import { Waveform } from './Waveform.tsx'
 import { VoiceSetupDialog } from './VoiceSetupDialog.tsx'
@@ -19,6 +21,8 @@ export interface VoiceInputActions {
   openSettings: () => void
   /** @returns one microphone operation owned by the plugin lifecycle. */
   createRecording: () => Recording
+  /** Remember the browser microphone used by previews and subsequent recordings. */
+  selectMicrophone: (device: MicrophoneDevice) => void
   transcribe: (request: TranscriptionRequest, signal: AbortSignal) => Promise<RemoteResult<Transcript>>
   prepare: (providerId: SpeechProviderId, options?: SpeechPreparationOptions) => Promise<void>
   cancelPreparation: (providerId: SpeechProviderId) => Promise<void>
@@ -27,7 +31,12 @@ export interface VoiceInputActions {
 
 /** Entry-injected Host readiness and microphone operations. */
 export interface VoiceInputInjected extends VoiceInputActions {
-  hooks: { speechReadiness: HostObservable<SpeechReadiness> }
+  hooks: {
+    speechReadiness: HostObservable<SpeechReadiness>
+    microphoneDevice: HostObservable<MicrophoneDevice>
+    /** Whether the Plugins page navigation service is present; the setup dialog offers the details only while it is. */
+    pluginNavigation: HostObservable<boolean>
+  }
 }
 
 /** Composer-owned expansion and draft actions; preferences stay in plugin settings. */
@@ -54,8 +63,9 @@ async function disposeRecording(capture: Recording): Promise<void> {
 
 /** Render a compact microphone or an expanded capture, transcription, or retry row. */
 export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
-  createRecording, transcribe, openSettings, useSpeechReadiness, t }: VoiceInputProps) {
+  createRecording, transcribe, openSettings, useSpeechReadiness, usePluginNavigation, t }: VoiceInputProps) {
   const readiness = useSpeechReadiness(value => value), catalog = readiness.catalog
+  const navigable = usePluginNavigation(present => present)
   const provider = catalog?.providers.find(item => item.id === catalog.selection.providerId)
   const usable = readiness.connected && (provider?.preparation.phase === 'ready' || provider?.preparation.phase === 'standby'
     || provider?.preparation.phase === 'waking')
@@ -95,8 +105,6 @@ export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
   }, [sessionId])
 
   const feedback = (text: string): void => { setMessage(text); setPhase('feedback') }
-  const failureText = (failure: unknown): string => failure instanceof RecordingError ? t(failure.kind)
-    : t('failed', { message: failure instanceof Error ? failure.message : String(failure) })
   const finish = async (): Promise<void> => {
     const active = current.current
     if (!active || active.phase !== 'recording') return
@@ -115,7 +123,7 @@ export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
       setPhase('idle')
     } catch (failure) {
       await disposeRecording(active.capture)
-      if (run === generation.current) feedback(failureText(failure))
+      if (run === generation.current) feedback(failureText(failure, t))
     } finally { if (run === generation.current) current.current = undefined }
   }
   const start = async (): Promise<void> => {
@@ -131,7 +139,7 @@ export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
         if (run !== generation.current || current.current !== active || active.phase === 'transcribing') return
         current.current = undefined
         clearTimeout(active.timer); active.abort.abort()
-        feedback(failureText(failure))
+        feedback(failureText(failure, t))
       })
       if (run !== generation.current || current.current !== active) return
       active.phase = 'recording'
@@ -139,7 +147,7 @@ export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
       active.timer = setTimeout(() => { void finish() }, active.maxDurationSeconds * 1000)
     } catch (failure) {
       await disposeRecording(active.capture)
-      if (run === generation.current) { current.current = undefined; feedback(failureText(failure)) }
+      if (run === generation.current) { current.current = undefined; feedback(failureText(failure, t)) }
     }
   }
   if (!expanded) return <>
@@ -151,7 +159,8 @@ export function VoiceInput({ sessionId, inputActions, locked, onActiveChange,
     </Tooltip>
     <VoiceSetupDialog open={setupOpen && !usable}
       needsInstallation={readiness.connected && provider?.location === 'host-local' && provider.preparation.phase === 'unprepared'}
-      onDismiss={() => { setSetupOpen(false) }} onOpenDetails={() => { setSetupOpen(false); openSettings() }} t={t} />
+      onDismiss={() => { setSetupOpen(false) }}
+      onOpenDetails={navigable ? () => { setSetupOpen(false); openSettings() } : undefined} t={t} />
   </>
   return <div className={css.captureRow} data-voice-activity={phase}>
     <Button type="button" className={css.roundButton} size="sm" aria-label={t(pending ? 'discard' : 'cancel')}

@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, onTestFinished, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
 import { SessionSeq } from '@deepseek-ai/dsh-session/types'
@@ -14,7 +15,9 @@ import {
 } from '@deepseek-ai/dsh-client-test-runtime/src/assembly/index.ts'
 import type {} from '@deepseek-ai/dsh-session-title/client'
 import { SessionManager } from '../src/client/sessions/manager.ts'
+import { ClientSessions } from '../src/client/sessions/service.ts'
 import type { SessionRemotes } from '../src/client/sessions/remotes.ts'
+import type { SessionProjectionHints } from '../src/types.ts'
 import { entries, plainTurn } from './event-script.client.ts'
 import { FOLLOW, err, followScript, sessionWorld } from './remote/session.client.ts'
 
@@ -375,9 +378,9 @@ describe('SessionManager instances', () => {
     const stopObserving = manager.subscribe(() => { published.resolve(undefined) })
     try {
       manager.handleControlFrame({ type: 'projection', sessionId: S1,
-        key: 'sessionListMetadata', value: { blank: false, lastPromptAt: 1200 }, seq: 8 })
+        changes: [{ key: 'sessionListMetadata', val: { blank: false, lastPromptAt: 1200 } }], seq: 8 })
       manager.handleControlFrame({ type: 'projection', sessionId: S2,
-        key: 'sessionListMetadata', value: { blank: true, lastPromptAt: null }, seq: 2 })
+        changes: [{ key: 'sessionListMetadata', val: { blank: true, lastPromptAt: null } }], seq: 2 })
       // The initial notification must finish while neither Session is resident.
       await published.promise
 
@@ -424,7 +427,7 @@ describe('SessionManager query lifetime', () => {
     const entries = [{ id: S2, createdAt: 1, mode: 'one-shot' as const }]
     try {
       if (warm) {
-        manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 0, value: entries })
+        manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'subagentCatalog', val: entries }], seq: 0 })
       }
       remote.session.projections.mockRejectedValueOnce(failure)
       await manager.refreshProjections(S1)
@@ -443,9 +446,9 @@ describe('list lifecycle', () => {
     const manager = makeManager(mock, remote)
     try {
       manager.handleControlFrame({ type: 'projection', sessionId: S1,
-        key: 'sessionListMetadata', value: { blank: false, lastPromptAt: 1200 }, seq: 8 })
+        changes: [{ key: 'sessionListMetadata', val: { blank: false, lastPromptAt: 1200 } }], seq: 8 })
       manager.handleControlFrame({ type: 'projection', sessionId: S2,
-        key: 'sessionListMetadata', value: { blank: true, lastPromptAt: null }, seq: 2 })
+        changes: [{ key: 'sessionListMetadata', val: { blank: true, lastPromptAt: null } }], seq: 2 })
       remote.session.list.mockResolvedValue(ok({ items: [
         summary(S1, { blank: true }), summary(S2),
       ] as never[] }))
@@ -454,7 +457,7 @@ describe('list lifecycle', () => {
       expect(manager.get(S1).getSnapshot().blank).toBe(false)
       expect(manager.get(S2).getSnapshot().blank).toBe(false)
       manager.handleControlFrame({ type: 'projection', sessionId: S1,
-        key: 'sessionListMetadata', value: { blank: true, lastPromptAt: null }, seq: 7 })
+        changes: [{ key: 'sessionListMetadata', val: { blank: true, lastPromptAt: null } }], seq: 7 })
       expect(manager.getListSnapshot().items[0]).toMatchObject({ blank: false, updatedAt: 1200 })
     } finally {
       await manager.dispose()
@@ -611,7 +614,7 @@ describe('list lifecycle', () => {
   it('retains title projections before list arrival, keeps last-wins by seq, and clears them on removal', async ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
     const titleFrame = (title: string, seq: number) => {
-      manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'title', value: title, seq })
+      manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'title', val: title }], seq })
     }
     titleFrame('Newest', 4)
     titleFrame('Stale', 3)
@@ -631,11 +634,34 @@ describe('list lifecycle', () => {
     expect(manager.getListSnapshot().items.find(item => item.sessionId === S1)?.title).toBeUndefined()
   })
 
+  it('applies every key of one per-event frame with one list invalidation and per-key seq gating', async ({ mock, remote }) => {
+    remote.session.list.mockResolvedValue(ok({ items: [summary(S1, { blank: true })] as never[] }))
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    await manager.refreshList()
+    manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'title', val: 'Newest' }], seq: 4 })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // Bracket access reaches the private list notifier; projection-store notifiers stay out of the count.
+    const markDirty = vi.spyOn(manager['notifier'], 'markDirty')
+
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S1, seq: 3, changes: [
+        { key: 'title', val: 'Stale' },
+        { key: 'sessionListMetadata', val: { blank: false, lastPromptAt: 1200 } },
+      ],
+    })
+    expect(markDirty).toHaveBeenCalledOnce()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(manager.getListSnapshot().items[0]).toMatchObject({ sessionId: S1, title: 'Newest', blank: false })
+    expect(manager.projectionValues(S1)).toMatchObject({ sessionListMetadata: { blank: false, lastPromptAt: 1200 } })
+  })
+
   it('fills cold titles from the list rows\' projections block as cached values', async ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
     // A push frame landed before the list: S2's title is a sequenced value.
     manager.handleControlFrame({
-      type: 'projection', sessionId: S2, key: 'title', value: 'Pushed', seq: 9,
+      type: 'projection', sessionId: S2, changes: [{ key: 'title', val: 'Pushed' }], seq: 9,
     })
     remote.session.list.mockResolvedValue(ok({
       items: [
@@ -647,6 +673,7 @@ describe('list lifecycle', () => {
     const items = manager.getListSnapshot().items
     // Cold row: title surfaces straight from the list block — no open, no history.
     expect(items.find(item => item.sessionId === S1)?.title).toBe('Cold cached')
+    expect(manager.getListSnapshot().projectionsBySession[S1]?.state).toBe('idle')
     // A cached list block never displaces a sequenced value, whatever watermark its record holds.
     expect(items.find(item => item.sessionId === S2)?.title).toBe('Pushed')
   })
@@ -656,7 +683,7 @@ describe('list lifecycle', () => {
     const manager = makeManager(mock, remote)
     try {
       await manager.refreshList()
-      manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'title', value: 'Unflushed', seq: 4 })
+      manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'title', val: 'Unflushed' }], seq: 4 })
 
       manager.handleConnected()
       await manager.refreshList()
@@ -730,12 +757,95 @@ describe('Host Remote event routing', () => {
 })
 
 describe('subagent catalogs', () => {
+  it('retains external membership without creating a local browsing address', ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    const entries = [{ id: S2, createdAt: 1, mode: 'external' as const, label: 'external task' }]
+    manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'subagentCatalog', val: entries }], seq: 0 })
+
+    expect(manager.getListSnapshot().projectionsBySession[S1]?.values.subagentCatalog).toEqual(entries)
+    expect(manager.subagentAddress(S2)).toBeUndefined()
+    expect(manager.getListSnapshot().items).toEqual([])
+  })
+
+  it('prefers retained and catalog addresses to header-derived unknown modes', ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    manager.handleSessionAdded(summary(S2, { parentSessionId: S1, origin: 'subagent' }))
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S1, seq: 0, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'worker' }] },
+      ],
+    })
+
+    expect(manager.subagentAddress(S2)).toEqual({
+      parentSessionId: S1, childSessionId: S2, mode: 'continuable',
+    })
+    const retained: SubagentAddress = { parentSessionId: S1, childSessionId: S2, mode: 'one-shot' }
+    manager.resolveTarget(retained)
+    expect(manager.subagentAddress(S2)).toBe(retained)
+    expect(remote.session.list).not.toHaveBeenCalled()
+    expect(remote.session.projections).not.toHaveBeenCalled()
+  })
+
+  it.for([
+    ['ordinary session', {}],
+    ['ordinary fork', { parentSessionId: S1 }],
+    ['parentless subagent', { origin: 'subagent' }],
+  ] as const)('does not derive a subagent address for an %s', ([, fields], { mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    manager.handleSessionAdded(summary(S2, fields))
+
+    expect(manager.subagentAddress(S2)).toBeUndefined()
+    expect(manager.subagentAddress(S1)).toBeUndefined()
+    expect(manager.resolveTarget(S2)).toBe(S2)
+    expect(manager.get(S2).getSnapshot().subagent).toBeNull()
+    expect(remote.session.list).not.toHaveBeenCalled()
+    expect(remote.session.projections).not.toHaveBeenCalled()
+  })
+
+  it('retains a header-discovered ancestor through subagent follow without discovery reads', async ({ mock, remote, start }) => {
+    const grandchild = 'header-grandchild' as SessionId
+    const descendantAddress: SubagentAddress = {
+      parentSessionId: S2, childSessionId: grandchild, mode: 'continuable',
+    }
+    const ancestorAddress: SubagentAddress = { parentSessionId: S1, childSessionId: S2, mode: 'unknown' }
+    mock.load(sessionWorld)
+    remote.session.list.mockResolvedValueOnce(ok({ items: [
+      summary(S1),
+      summary(S2, { parentSessionId: S1, origin: 'subagent' }),
+      summary(grandchild, { parentSessionId: S2, origin: 'subagent' }),
+    ] }))
+    const client = await start()
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const sessions = new ClientSessions(ctx, client.ctx.remote)
+    await sessions.refresh()
+    using descendant = sessions.retain(descendantAddress, { source: 'mainView' })
+    await descendant.ready
+
+    using ancestor = sessions.retain(S2, { source: 'mainView' })
+    await ancestor.ready
+
+    expect(mock.log.requests(FOLLOW)).toMatchObject([
+      { address: { kind: 'subagent', ...descendantAddress } },
+      { address: { kind: 'subagent', ...ancestorAddress } },
+    ])
+    expect(ancestor.binding.session.getSnapshot()).toMatchObject({
+      openState: 'open', subagent: { address: ancestorAddress },
+    })
+    expect(remote.session.list).toHaveBeenCalledOnce()
+    expect(remote.session.projections).not.toHaveBeenCalled()
+    expect(mock.log.requests('session/page')).toEqual([])
+  })
+
   it('keeps a catalog-discovered child address across identity resolution and status frames', async ({ mock, remote, start }) => {
     remote.session.list.mockImplementation(() => Promise.resolve(ok({ items: [
       summary(S1),
       summary(S2, { parentSessionId: S1, origin: 'subagent' }),
     ] as never[] })))
-    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1,
+    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1,
       id: S2, mode: 'continuable', label: 'worker',
     }] } })))
     mock.load(sessionWorld)
@@ -752,7 +862,6 @@ describe('subagent catalogs', () => {
       address: {
         parentSessionId: S1, childSessionId: S2, mode: 'continuable',
       },
-      parentAvailable: true,
     })
     // Clicking the same child through an ordinary list-selection path must not
     // erase the catalog-derived address and fall back to session.* transport.
@@ -764,7 +873,6 @@ describe('subagent catalogs', () => {
       address: {
         parentSessionId: S1, childSessionId: S2, mode: 'continuable',
       },
-      parentAvailable: true,
     })
     await manager.get(S2).open()
     await manager.get(S2).prompt([{ type: 'text', text: 'continue' }], 'queue')
@@ -776,7 +884,7 @@ describe('subagent catalogs', () => {
           childSessionId: S2,
           mode: 'continuable',
         },
-        assistantStream: true,
+        activate: true, assistantStream: true,
         maxMessages: 500,
         turnWindow: { minMessages: 50, minTurns: 2 },
       },
@@ -785,8 +893,7 @@ describe('subagent catalogs', () => {
     expect(remote.subagents.prompt.mock.calls.map(([request]) => request)).toEqual([
       {
         requestId: expect.any(String) as unknown as string,
-        parentSessionId: S1, childSessionId: S2,
-        mode: 'continuable',
+        childSessionId: S2,
         delivery: 'queue',
         content: [{ type: 'text', text: 'continue' }],
         clientTimeZone: new Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -820,14 +927,17 @@ describe('subagent catalogs', () => {
     const client = await start()
     const manager = new SessionManager(client.ctx.remote)
     const entries = [{ id: S2, createdAt: 1, mode: 'unknown' as const }]
-    manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 0, value: entries })
+    manager.handleControlFrame({ type: 'projection', sessionId: S1, changes: [{ key: 'subagentCatalog', val: entries }], seq: 0 })
     const address = manager.subagentAddress(S2)!
     expect(address).toEqual({ parentSessionId: S1, childSessionId: S2, mode: 'unknown' })
     manager.resolveTarget(address)
     const child = manager.get(S2)
     expect(child.getSnapshot().subagent?.address.mode).toBe('unknown')
-    manager.handleControlFrame({ type: 'projection', sessionId: S2, key: 'subagent', seq: 0,
-      value: { seq: SessionSeq(0), mode: 'continuable', label: 'repaired child' } })
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S2, seq: 0, changes: [
+        { key: 'subagent', val: { seq: SessionSeq(0), mode: 'continuable', label: 'repaired child' } },
+      ],
+    })
     await child.open()
     expect(child.getSnapshot().subagent?.address).toEqual({ ...address, mode: 'continuable' })
     expect(manager.getListSnapshot().projectionsBySession[S1]?.values.subagentCatalog).toEqual(entries)
@@ -838,8 +948,9 @@ describe('subagent catalogs', () => {
     const manager = makeManager(mock, remote)
     manager.handleSessionAdded(summary(S2, { origin: 'subagent', parentSessionId: S1, running: true }))
     manager.handleControlFrame({
-      type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 4,
-      value: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'worker' }],
+      type: 'projection', sessionId: S1, seq: 4, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'worker' }] },
+      ],
     })
     expect(manager.getListSnapshot().projectionsBySession[S1]?.values.subagentCatalog).toEqual([
       { id: S2, createdAt: 1, mode: 'continuable', label: 'worker' },
@@ -848,49 +959,103 @@ describe('subagent catalogs', () => {
     expect(remote.session.projections.mock.calls.map(([request]) => request)).toEqual([])
   })
 
+  it.for(['control', 'follow'] as const)('replaces cached projection hints with the %s baseline', async (source, { mock, remote, start }) => {
+    mock.load(sessionWorld)
+    remote.session.projections.mockResolvedValueOnce(ok({ kind: 'migration-required', values: {
+      title: 'Cached title',
+      subagentCatalog: [{ id: S2, createdAt: 1, mode: 'unknown' }],
+    } }))
+    const client = await start()
+    const manager = new SessionManager(client.ctx.remote)
+    onTestFinished(() => manager.dispose())
+
+    await manager.refreshProjections(S1)
+    expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({
+      state: 'migration-required', error: null,
+      values: { title: 'Cached title', subagentCatalog: [{ id: S2, mode: 'unknown' }] },
+    })
+    expect(remote.session.follow).not.toHaveBeenCalled()
+    const session = manager.get(S1)
+    expect(session.projections.seqOf('subagentCatalog')).toBeUndefined()
+    const baseline = { asOfSeq: 0, values: {
+      subagentCatalog: [{ id: S2, createdAt: 1, mode: 'one-shot' as const, label: 'Loaded child' }],
+    } }
+    if (source === 'control') {
+      manager.handleControlFrame({ type: 'baseline', value: { projections: { [S1]: baseline } } })
+    } else {
+      mock.stream(FOLLOW, followScript(ok({ cursor: baseline.asOfSeq, records: [], hasMore: false, projections: baseline })))
+      await session.open()
+    }
+
+    expect(manager.getListSnapshot().projectionsBySession[S1]?.values).toEqual(baseline.values)
+    expect(session.projections.seqOf('subagentCatalog')).toBe(0)
+    expect(session.projections.get('title')).toBeUndefined()
+  })
+
+  it.for(['control', 'follow'] as const)('keeps %s projections when a cached read arrives late', async (source, { mock, remote, start }) => {
+    mock.load(sessionWorld)
+    const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.projections>>>()
+    remote.session.projections.mockReturnValueOnce(response.promise)
+    const client = await start()
+    const manager = new SessionManager(client.ctx.remote)
+    const read = manager.refreshProjections(S1)
+    const baseline = { asOfSeq: 4, values: {
+      title: 'Loaded title',
+      subagentCatalog: [{ id: S2, createdAt: 1, mode: 'continuable' as const, label: 'Loaded child' }],
+    } }
+    try {
+      expect(remote.session.projections).toHaveBeenCalledOnce()
+      if (source === 'control') {
+        manager.handleControlFrame({ type: 'baseline', value: { projections: { [S1]: baseline } } })
+      } else {
+        mock.stream(FOLLOW, followScript(ok({ cursor: baseline.asOfSeq, records: [], hasMore: false, projections: baseline })))
+        await manager.get(S1).open()
+      }
+      response.resolve(ok({ kind: 'migration-required', values: {
+        title: 'Cached title', subagentCatalog: [{ id: S2, createdAt: 1, mode: 'unknown' }],
+      } }))
+      await read
+
+      expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({
+        state: 'migration-required', error: null, values: baseline.values,
+      })
+      expect(manager.get(S1).projections.seqOf('subagentCatalog')).toBe(4)
+    } finally {
+      response.resolve(ok(null))
+      await read
+      await manager.dispose()
+    }
+  })
+
   it('keeps newer pushed membership when the initial read returns an older baseline', async ({ mock, remote }) => {
     const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.projections>>>()
     remote.session.projections.mockImplementation(() => response.promise)
     const manager = makeManager(mock, remote)
     const read = manager.refreshProjections(S1)
     manager.handleControlFrame({
-      type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 5,
-      value: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'pushed' }],
+      type: 'projection', sessionId: S1, seq: 5, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'pushed' }] },
+      ],
     })
-    response.resolve(ok({ asOfSeq: 3, values: { subagentCatalog: [] } }))
+    response.resolve(ok({ kind: 'sequenced', asOfSeq: 3, values: { subagentCatalog: [] } }))
     await read
     expect(manager.getListSnapshot().projectionsBySession[S1]?.values.subagentCatalog?.[0]?.label).toBe('pushed')
     expect(remote.session.projections.mock.calls.map(([request]) => request)).toHaveLength(1)
   })
 
-  it.for([false, true])('keeps live parent availability when an earlier initial read settles (failure: %s)', async (failure, { mock, remote }) => {
-    const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.projections>>>()
-    remote.session.projections.mockImplementation(() => response.promise)
+  it('retries a migration-deferred projection read and accepts the completed catalog', async ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
-    manager.resolveTarget({ parentSessionId: S1, childSessionId: S2, mode: 'continuable' })
-    const child = manager.get(S2)
-    const read = manager.refreshProjections(S1)
-    manager.handleSessionAdded(summary(S1))
-    manager.handleSessionStatus(S1, false)
-    response.resolve(failure
-      ? err(new RemoteError('gateway/internal', 'offline', {}))
-      : ok({ asOfSeq: 0, values: { subagentCatalog: [] } }))
-    await read
-    expect(child.getSnapshot().subagent?.parentAvailable).toBe(true)
-    expect(remote.session.projections.mock.calls.map(([request]) => request)).toHaveLength(1)
-  })
-
-  it('keeps parent availability unknown after list failure and accepts a later Host summary', async ({ mock, remote }) => {
-    const manager = makeManager(mock, remote)
-    manager.resolveTarget({ parentSessionId: S1, childSessionId: S2, mode: 'continuable' })
-    const child = manager.get(S2)
-    remote.session.list.mockResolvedValue(err(new RemoteError('gateway/internal', 'offline', {})))
-    await manager.refreshList()
-    expect(manager.getListSnapshot().state).toBe('error')
-    expect(child.getSnapshot().subagent?.parentAvailable).toBeUndefined()
-    manager.handleSessionAdded(summary(S1))
-    expect(child.getSnapshot().subagent?.parentAvailable).toBe(true)
-    await manager.dispose()
+    remote.session.projections.mockResolvedValueOnce(ok({ kind: 'migration-required', values: {} }))
+    await manager.refreshProjections(S1)
+    expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({
+      state: 'migration-required', values: {},
+    })
+    remote.session.projections.mockResolvedValueOnce(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [] } }))
+    await manager.refreshProjections(S1)
+    expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({
+      state: 'ready', values: { subagentCatalog: [] },
+    })
+    expect(remote.session.projections).toHaveBeenCalledTimes(2)
   })
 
   it('keeps a pushed catalog when an earlier initial read reports the parent missing', async ({ mock, remote }) => {
@@ -898,8 +1063,11 @@ describe('subagent catalogs', () => {
     remote.session.projections.mockImplementation(() => response.promise)
     const manager = makeManager(mock, remote)
     const read = manager.refreshProjections(S1)
-    manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 1,
-      value: [{ id: S2, createdAt: 1, mode: 'one-shot' }] })
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S1, seq: 1, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'one-shot' }] },
+      ],
+    })
     response.resolve(ok(null))
     await read
     expect(manager.getListSnapshot().projectionsBySession[S1]?.values.subagentCatalog).toEqual([
@@ -914,7 +1082,7 @@ describe('subagent catalogs', () => {
     const read = manager.refreshProjections(S1)
     expect(manager.refreshProjections(S1)).toBe(read)
     expect(manager.getListSnapshot().projectionsBySession[S1]?.state).toBe('loading')
-    response.resolve(ok({ asOfSeq: 0, values: {
+    response.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: {
       subagentCatalog: [{ id: S2, createdAt: 1, mode: 'one-shot' }],
       title: 'cold parent',
     } }))
@@ -935,7 +1103,7 @@ describe('subagent catalogs', () => {
     const read = manager.refreshProjections(S1)
     manager.handleSessionAdded(summary(S2, { origin: 'subagent', parentSessionId: S1 }))
     manager.handleSessionStatus(S2, true)
-    response.resolve(ok({ asOfSeq: 0, values: {
+    response.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: {
       subagentCatalog: [{ id: S2, createdAt: 1, mode: 'continuable', label: 'worker' }],
     } }))
     await read
@@ -948,9 +1116,12 @@ describe('subagent catalogs', () => {
   it('keeps completed unselected child metadata with its durable catalog row', ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
     manager.handleSessionAdded(summary(S2, { origin: 'subagent', parentSessionId: S1, running: true }))
-    manager.handleControlFrame({ type: 'projection', sessionId: S2, key: 'title', value: 'finished child', seq: 2 })
-    manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 1,
-      value: [{ id: S2, createdAt: 1, mode: 'one-shot' }] })
+    manager.handleControlFrame({ type: 'projection', sessionId: S2, changes: [{ key: 'title', val: 'finished child' }], seq: 2 })
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S1, seq: 1, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'one-shot' }] },
+      ],
+    })
     manager.handleSessionRemoved(S2)
     expect(manager.getListSnapshot().items[0]).toMatchObject({ title: 'finished child', running: false })
     expect(manager.getListSnapshot().items.find(item => item.sessionId === S2)?.running).toBe(false)
@@ -965,11 +1136,14 @@ describe('subagent catalogs', () => {
   it('retries a failed initial read without discarding pushed entries', async ({ mock, remote }) => {
     remote.session.projections.mockImplementation(() => Promise.resolve(err(new RemoteError('gateway/internal', 'offline', {}))))
     const manager = makeManager(mock, remote)
-    manager.handleControlFrame({ type: 'projection', sessionId: S1, key: 'subagentCatalog', seq: 2,
-      value: [{ id: S2, createdAt: 1, mode: 'one-shot' }] })
+    manager.handleControlFrame({
+      type: 'projection', sessionId: S1, seq: 2, changes: [
+        { key: 'subagentCatalog', val: [{ id: S2, createdAt: 1, mode: 'one-shot' }] },
+      ],
+    })
     await manager.refreshProjections(S1)
     expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({ state: 'error', values: { subagentCatalog: [{ id: S2 }] } })
-    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ asOfSeq: 2, values: { subagentCatalog: [] } })))
+    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ kind: 'sequenced', asOfSeq: 2, values: { subagentCatalog: [] } })))
     await manager.refreshProjections(S1)
     expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({ state: 'ready', values: { subagentCatalog: [{ id: S2 }] } })
   })
@@ -980,7 +1154,7 @@ describe('subagent catalogs', () => {
     const manager = makeManager(mock, remote)
     const read = manager.refreshProjections(S1)
     manager.handleSessionRemoved(S1)
-    response.resolve(ok({ asOfSeq: 0, values: { subagentCatalog: [] } }))
+    response.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [] } }))
     await read
     expect(manager.getListSnapshot().items.some(item => item.sessionId === S1)).toBe(false)
     expect(remote.session.projections.mock.calls.map(([request]) => request)).toHaveLength(1)
@@ -1026,6 +1200,17 @@ describe('remaining branches', () => {
     expect(await manager.create()).toMatchObject({ ok: false })
   })
 
+  it('create forwards the requested Agent preset and catalogs the identity the Host returns', async ({ mock, remote }) => {
+    remote.session.create.mockResolvedValue(ok({ sessionId: S2, agentPreset: 'minimal' }))
+    const manager = makeManager(mock, remote)
+
+    const result = await manager.create({ workspaceId: 'w1' as never, sessionId: S1, agentPreset: 'minimal' })
+
+    expect(remote.session.create).toHaveBeenCalledExactlyOnceWith({ workspaceId: 'w1', sessionId: S1, agentPreset: 'minimal' })
+    expect(result).toMatchObject({ ok: true, value: { sessionId: S2 } })
+    expect(manager.getListSnapshot().items.map(item => item.sessionId)).toEqual([S2])
+  })
+
   it.for(['create', 'fork'] as const)('preserves pushed running state when a %s response arrives later', async (operation, { mock, remote }) => {
     const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.create>>>()
     remote.session[operation].mockImplementation(() => response.promise)
@@ -1042,23 +1227,6 @@ describe('remaining branches', () => {
     await manager.dispose()
   })
 
-  it('preserves Host availability when a local create echo follows Agent disposal', async ({ mock, remote }) => {
-    const response = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.create>>>()
-    remote.session.create.mockImplementation(() => response.promise)
-    const manager = makeManager(mock, remote)
-    manager.resolveTarget({
-      parentSessionId: S1, childSessionId: S2, mode: 'continuable',
-    })
-    const child = manager.get(S2)
-    const request = manager.create()
-    manager.handleSessionAdded(summary(S1, { agentAvailable: false }))
-    response.resolve(ok({ sessionId: S1 }))
-    await request
-    manager.resolveTarget(S2)
-    expect(child.getSnapshot().subagent?.parentAvailable).toBe(false)
-    await manager.dispose()
-  })
-
   it('publishes a real Ungrouped summary from workspace-attach-failed', async ({ mock, remote }) => {
     remote.session.create.mockResolvedValue(err(new RemoteError('session/workspace-attach-failed', 'published but unattached', {
       sessionId: S1, workspaceId: 'w1',
@@ -1070,6 +1238,21 @@ describe('remaining branches', () => {
     expect(manager.getListSnapshot().items[0]).not.toHaveProperty('cwd')
   })
 
+  it.for([undefined, false, true])('forwards fork migration permission %s to the Remote request', async (allowMigration, { mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    remote.session.fork.mockResolvedValueOnce(ok({ sessionId: S2 }))
+    const permission = allowMigration === undefined ? {} : { allowMigration }
+
+    await expect(manager.fork({ sessionId: S1, atSeq: SessionSeq(7), ...permission }))
+      .resolves.toEqual(ok({ sessionId: S2 }))
+
+    expect(remote.session.fork).toHaveBeenCalledExactlyOnceWith({ sessionId: S1, atSeq: 7, ...permission })
+    expect(remote.session.follow).not.toHaveBeenCalled()
+    expect(manager.getListSnapshot().items[0]).toMatchObject({ sessionId: S2 })
+    expect(manager.getListSnapshot().items[0]).not.toHaveProperty('parentSessionId')
+  })
+
   it('reconciles a fork child published before workspace attachment fails', async ({ mock, remote }) => {
     remote.session.fork.mockResolvedValue(err(new RemoteError('session/workspace-attach-failed', 'forked but unattached', {
       sessionId: S2, workspaceId: 'w1',
@@ -1079,13 +1262,12 @@ describe('remaining branches', () => {
     expect(result).toMatchObject({ ok: false, error: { code: 'session/workspace-attach-failed' } })
     expect(manager.getListSnapshot().items).toEqual([expect.objectContaining({
       sessionId: S2,
-      parentSessionId: S1,
       blank: true,
     })])
 
-    manager.handleSessionAdded(summary(S2, { blank: true, parentSessionId: S1 }))
+    manager.handleSessionAdded(summary(S2, { blank: true }))
     expect(manager.getListSnapshot().items[0]?.blank).toBe(true)
-    manager.handleSessionAdded(summary(S2, { blank: false, parentSessionId: S1 }))
+    manager.handleSessionAdded(summary(S2, { blank: false }))
     expect(manager.getListSnapshot().items[0]?.blank).toBe(false)
   })
 
@@ -1306,7 +1488,7 @@ describe('connected generation', () => {
       summary(S1),
       summary(S2, { parentSessionId: S1, origin: 'subagent', running: hostRunning }),
     ] as never[] })))
-    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1, id: S2, mode: 'continuable', label: 'worker' }] } })))
+    remote.session.projections.mockImplementation(() => Promise.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1, id: S2, mode: 'continuable', label: 'worker' }] } })))
     const manager = makeManager(mock, remote)
     try {
       await manager.refreshList()
@@ -1330,13 +1512,13 @@ describe('connected generation', () => {
     const previous = Promise.withResolvers<Awaited<ReturnType<typeof remote.session.projections>>>()
     remote.session.projections
       .mockReturnValueOnce(previous.promise)
-      .mockResolvedValue(ok({ asOfSeq: 0, values: { subagentCatalog: [] } }))
+      .mockResolvedValue(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [] } }))
     const manager = makeManager(mock, remote)
     try {
       const read = manager.refreshProjections(S1)
       manager.handleConnected()
       expect(remote.session.projections.mock.calls.map(([request]) => request)).toHaveLength(2)
-      previous.resolve(ok({ asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1, id: S2, mode: 'continuable', label: 'worker' }] } }))
+      previous.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1, id: S2, mode: 'continuable', label: 'worker' }] } }))
       await read
       await vi.waitFor(() => {
         expect(manager.getListSnapshot().projectionsBySession[S1]).toMatchObject({
@@ -1351,6 +1533,7 @@ describe('connected generation', () => {
 
   it('refreshes query baselines without rebuilding independently resumed Session sources', async ({ mock, remote, start }) => {
     mock.stream(FOLLOW, followScript(ok({
+      cursor: 5,
       records: entries(plainTurn(SessionSeq(0), 0, 'a', 'b')) as never[],
       hasMore: false,
       modelSelection: { provider: 'deepseek-official', model: 'deepseek-chat' },
@@ -1384,7 +1567,7 @@ describe('connected generation', () => {
 
     manager.handleConnected()
     expect(manager.get(S2).getSnapshot().subagent).toEqual({ address })
-    parent.resolve(ok({ asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1,
+    parent.resolve(ok({ kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [{ createdAt: 1,
       id: S2, mode: 'continuable', label: 'worker',
     }] } }))
 
@@ -1398,7 +1581,6 @@ describe('connected generation', () => {
     })
     expect(manager.get(S2).getSnapshot().subagent).toEqual({
       address,
-      parentAvailable: true,
     })
     expect(manager.subagentAddress(S2)).toEqual(address)
   })
@@ -1418,5 +1600,32 @@ describe('running facts without UI reminders', () => {
     expect(entry).toMatchObject({ running: false })
     expect(entry).not.toHaveProperty('completed')
     expect(manager.getListSnapshot()).not.toHaveProperty('current')
+  })
+})
+
+describe('Session summary projection replacement', () => {
+  it('drops a stale summary-excluded key when a reconnect refresh replaces the row block', async ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    // A row block from a verbose Host still carrying an excluded key; the wire
+    // type no longer admits it, so the fixture is parsed as annotated JSON.
+    const verboseBlock = JSON.parse(
+      '{"kind":"cached","asOfSeq":1,"values":{"title":"stale","turnOutline":[]}}',
+    ) as SessionProjectionHints
+    remote.session.list.mockResolvedValueOnce(ok({ items: [{ ...summary(S1), projections: verboseBlock }] }))
+    await manager.refreshList()
+    expect(manager.getListSnapshot().items[0]?.projectionValues).toHaveProperty('turnOutline')
+
+    // A reconnect clears every per-Session value store before pulling again, so
+    // the refreshed summary block is the row's only source: the excluded key
+    // cannot survive the replacement.
+    remote.session.list.mockResolvedValueOnce(ok({
+      items: [{ ...summary(S1), projections: { kind: 'cached', asOfSeq: 2, values: { title: 'fresh' } } }],
+    }))
+    manager.handleConnected()
+    await manager.refreshList()
+    const entry = manager.getListSnapshot().items[0]
+    expect(entry?.projectionValues).toEqual({ title: 'fresh' })
+    expect(entry?.title).toBe('fresh')
   })
 })

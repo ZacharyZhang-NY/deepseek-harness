@@ -3,12 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
-import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
-import * as CompactionInvariant from '@deepseek-ai/dsh-compaction/invariant'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import { CompactionId, isCompactCheckpointSource, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
@@ -106,16 +101,11 @@ interface LoopHarness {
   readonly log: string[]
 }
 
-/** Real loop, session store, and invariant companions around manual compaction. */
+/** Real loop and session store around manual compaction. */
 async function loopHarness(): Promise<LoopHarness> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   ctx.sessions.registerMessageProjection(imageOffloadProjection)
-  await ctx.plugin(InvariantRegistry)
-  await ctx.plugin(SessionInvariant)
-  await ctx.plugin(AgentInvariant)
-  await ctx.plugin(AgentLoopInvariant)
-  await ctx.plugin(CompactionInvariant)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(TokenMeter)
   const adapter = new TextAdapter()
@@ -890,17 +880,23 @@ describe('compactNow transaction and failure classification', () => {
     const { compact } = detachedService()
     const session = closedConversation(2)
     const agent = fakeAgent(session, () => () => undefined)
-    compact.gate = new Promise<undefined>((resolve) => {
-      setTimeout(() => { resolve(undefined) }, 5)
-    })
+    const openedAt = Date.now()
+    const originalNow = Date.now
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(openedAt)
+    try {
+      compact.duringSummary = () => { clock.mockReturnValue(openedAt + 25) }
 
-    await compact.compactNow(agent, SIGNAL)
+      await compact.compactNow(agent, SIGNAL)
 
-    const start = session.snapshotEvents().findLast(event => event.type === 'compaction/start')
-    const end = session.snapshotEvents().findLast(event => event.type === 'compaction/end')
-    expect(start).toBeDefined()
-    expect(end).toBeDefined()
-    expect(end!.time - start!.time).toBeGreaterThan(0)
+      const start = session.snapshotEvents().findLast(event => event.type === 'compaction/start')
+      const end = session.snapshotEvents().findLast(event => event.type === 'compaction/end')
+      expect(start?.time).toBe(openedAt)
+      expect(end?.time).toBe(openedAt + 25)
+      expect(end!.time - start!.time).toBe(25)
+    } finally {
+      clock.mockRestore()
+    }
+    expect(Date.now).toBe(originalNow)
   })
 
   it('excludes concurrent automatic and manual compaction of one session', async () => {

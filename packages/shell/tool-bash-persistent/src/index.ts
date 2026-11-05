@@ -3,6 +3,7 @@
  * @module @deepseek-ai/dsh-tool-bash-persistent
  */
 
+import type {} from '@deepseek-ai/dsh-working-directory'
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -253,10 +254,10 @@ function persistentShells(ctx: Context, config: ResolvedConfig): PersistentShell
     const combinedSignal = AbortSignal.any([signal, lifecycle.signal])
     const creation = (async () => {
       try {
-        const cwd = owner.session.header.cwd
+        const cwd = await ctx.workingDirectory.ensure(owner, combinedSignal)
         const spawned = await ctx.terminals.spawn(owner, {
           type: config.backendType,
-          ...cwd === undefined ? {} : { cwd },
+          cwd,
         }, combinedSignal)
         live.set(owner, spawned.sessionId)
         if (!ownerCleanupInstalled.has(owner)) {
@@ -266,10 +267,12 @@ function persistentShells(ctx: Context, config: ResolvedConfig): PersistentShell
             live.delete(owner)
           }, 'tool-bash-persistent owner cache cleanup')
         }
-        // Echo suppression only: the prompt stays the backend's own, so the
-        // backend's prompt-based readiness detection keeps working.
+        // Suppress input echo and history expansion, which would otherwise
+        // rewrite `!` sequences or discard the whole wrapper line before bash
+        // parses it. The prompt stays the backend's own, so the backend's
+        // prompt-based readiness detection keeps working.
         const setup = ctx.terminals.startSend(owner, spawned.sessionId, {
-          text: 'stty -echo',
+          text: 'stty -echo; set +H',
           submit: true,
           signal: combinedSignal,
         })
@@ -438,7 +441,7 @@ function registerPersistentBash(ctx: Context, config: ResolvedConfig): void {
 }
 
 export const name = 'tool-bash-persistent'
-export const inject = ['tools', 'terminals']
+export const inject = ['tools', 'terminals', 'workingDirectory']
 
 /** Configuration for the persistent Bash tool. */
 export interface Config {

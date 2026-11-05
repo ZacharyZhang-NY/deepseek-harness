@@ -4,6 +4,7 @@ import { Button, DisclosureRow, IconChevronDownOutlineRegular, StateDot, type St
 import type { InjectFace, PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SpeechPreparationState, SpeechProviderId, SpeechProviderView, SpeechSelectionPatch } from '@deepseek-ai/dsh-experimental-speech-to-text/types'
 import type { VoiceInputInjected } from './VoiceInput.tsx'
+import { MicrophonePicker } from './MicrophonePicker.tsx'
 import { NS } from './locales.ts'
 import css from './VoiceInput.module.css'
 
@@ -129,7 +130,7 @@ export function PreparationCard({ provider, connected, prepare, cancelPreparatio
 
 /** Recognition preferences and preparation cards shared by plugin details and Settings. */
 export function VoicePreparation({ useSpeechReadiness, ...props }: Pick<InjectFace<VoiceInputInjected>,
-  'useSpeechReadiness' | 'configure' | 'prepare' | 'cancelPreparation'> & PropsLocale<typeof NS>) {
+  'useSpeechReadiness' | 'configure' | 'prepare' | 'cancelPreparation' | 'createRecording' | 'useMicrophoneDevice' | 'selectMicrophone'> & PropsLocale<typeof NS>) {
   const readiness = useSpeechReadiness(value => value), catalog = readiness.catalog
   const [saving, setSaving] = useState(false), [error, setError] = useState('')
   const configure = async (patch: SpeechSelectionPatch): Promise<void> => {
@@ -139,10 +140,11 @@ export function VoicePreparation({ useSpeechReadiness, ...props }: Pick<InjectFa
   }
   const selected = catalog?.providers.find(provider => provider.id === catalog.selection.providerId)
   const languageNames: Readonly<Record<string, string>> = {
-    auto: props.t('auto'), zh: props.t('zh'), en: props.t('en'), yue: props.t('yue'), ja: props.t('ja'), ko: props.t('ko'),
+    auto: props.t('auto'), zh: props.t('zh'), en: props.t('en'), yue: props.t('yue'), ja: props.t('ja'), es: props.t('es'), fr: props.t('fr'), de: props.t('de'), ru: props.t('ru'), pt: props.t('pt'), ko: props.t('ko'),
   }
   return <div>
     {catalog && <div className={css.preferences}>
+      <MicrophonePicker {...props} />
       <label>{props.t('provider')}<select value={catalog.selection.providerId} disabled={!readiness.connected || saving}
         onChange={(event) => { void configure({ providerId: event.target.value as SpeechProviderId }) }}>
         {catalog.providers.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}

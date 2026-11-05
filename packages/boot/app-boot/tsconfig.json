@@ -21,13 +21,13 @@
       "path": "../../../vendor/group"
     },
     {
-      "path": "../../core/system-prompt"
-    },
-    {
       "path": "../../util/launch-environment"
     },
     {
       "path": "../../util/home-paths"
+    },
+    {
+      "path": "../../util/official-bundles"
     },
     {
       "path": "../../util/package-manifest"

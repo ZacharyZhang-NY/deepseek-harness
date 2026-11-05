@@ -69,7 +69,7 @@ Use the producer-owned branded id type across the process boundary. Put the `Ses
 
 Incremental events are supported. Prefer whole-value checkpoints when the producer can emit them cheaply, because they remain useful when the start is outside the loaded window. Each delta must carry the stable id and produce deterministic State when replayed in ascending log `seq`; it must not depend on live-only memory. If the current history window contains only updates, the assembler keeps a pending Context and builds no State until an older page supplies the start. If the product must render before the start is loaded, a terminal or checkpoint event must carry enough whole fallback state for the Definition to build that result directly; do not recover it by scanning unrelated events.
 
-Live Assistant deltas arrive as Client-only `assistant/live-chunk` events. Reconnect baselines expand the active process-local compact stream into the same transient events, while durable `assistant/message` and `assistant/attempt` events embed complete compact streams for history replay. A transient event may initialize a Context. A named tool delta and its later tool/call can both match as start under the same callId; only the earliest calls start(), and later Matches call update(). Historical pages do not expand settled messages into live deltas. A Definition that consumes Assistant output handles live chunks and durable settlements in the same `match()` and `update()` methods, while unrelated Definitions return `null` without expanding a stream.
+Live Assistant deltas arrive as Client-only `assistant/live-chunk` events. Reconnect baselines expand the active process-local compact stream into the same transient events, while durable `assistant/message` and `assistant/attempt` events embed complete compact streams for history replay. A transient event may initialize a Context. Every tool delta and its later `tool/call` can match as start under the same callId, even before the name arrives; only the earliest calls `start()`, and later Matches call `update()`. A preparing Tool node becomes visible only after its name is available. Historical pages do not expand settled messages into live deltas. A Definition that consumes Assistant output handles live chunks and durable settlements through the same matching and update interfaces, while unrelated Definitions return `null` without expanding a stream.
 
 ## Definition and typed Chat payload
 
@@ -245,9 +245,25 @@ export function apply(ctx: ClientContext): void {
 
 `match(event)` is an identity extractor, not a fold: it receives only the current `SessionEventLike` and returns the Definition-local id and lifecycle role. After a match, the assembler locates the Context by `(kind, id)` and initializes from its earliest loaded start, whether durable or transient. Every later Match calls `update`, including another start. Removing transient Matches reselects the start from remaining evidence and recomputes State; no remaining start leaves State undefined. Both functions return the State that the engine adopts; returning a new immutable value is preferred, but a function that mutates and returns the same object has the same adoption semantics.
 
+`ConversationNodeDefinitionInput` accepts either this function or a read-only table from event type to matching function. Function-form registrations receive every event; table registrations receive only their listed types. The Registry copies table entries and precomputes ordered candidate Sets when registrations change, keeping candidate construction out of per-event dispatch. Replace a table by unregistering and registering again. Resolved `ConversationNodeDefinition` values retain a callable `match(event)` in both cases.
+
+A match result with `exclusive: true` claims that event on the Definition's target. The assembler evaluates every match of the event before accepting any, so the outcome is independent of registration order: other Definitions of the claimed target build no Context for the event, and the target's unmatched-event fallback does not run. Definitions of other targets and Definitions without a target still receive it. Two claims on one target, or a claim from a Definition without a target, throw during dispatch; a claim returned by the fallback itself has no effect. A business Definition uses a claim to present one kind of message that a generic Definition of the same target would otherwise also present, such as a late question reply.
+
 `buildLocationData(context, scope)` optionally publishes Definition-owned data onto an engine-owned Turn or Step. Use declaration merging to give each key a precise value type. Another Node in the same Location can consume that value through its constrained slot hook, such as `useTurnData(key)`, without receiving the Session or scanning `snapshot.chat.nodes`.
 
 `target` and `buildViewNode(context)` declare one target-owned rendering contribution and must appear together. Preserve `context.key` as the React-facing identity, choose `anchorSeq` from the matched event ordering, and return only renderer-ready data. Once a target Node has been published, keep returning the same key; use `visibility: 'hidden'` when it must temporarily leave the visible flow rather than withdrawing it with `null`.
+
+A Chat Node also chooses where its row stands through `groupTree`. Positions are ordered from the outermost inward, and a Node at a position also has the effect of every inner one. Chat process grouping, whole-Turn folding, and Turn-input detection read only this position; [group-tree.ts](../../packages/client/ui-chat/src/client/contract/group-tree.ts) holds the complete contract.
+
+| The Node is | Declare |
+|---|---|
+| A person's input claimed in Step 1; its Turn opens an exchange | `exchange` |
+| Another input of its Turn, such as later human input or a trigger notice; before the process it is the opening input, after it the whole Turn stays open | `input` |
+| A Turn notice that stays outside whole-Turn folding, such as an error or the completed-turn footer | `turn` |
+| An independent row that whole-Turn folding still hides, such as a model retry | `process` |
+| Ordinary process content that joins the surrounding step run | omit `groupTree` |
+
+The [Chat business rules](../../packages/client/ui-chat/src/client/conversation-nodes/README.md#process-grouping) list the positions the built-in Nodes declare. When a generic Definition of the same target also matches the event your Node presents, claim the event with `exclusive: true` as described above.
 
 ## Predecessor reads
 
@@ -264,6 +280,7 @@ History may be requested from the tail backward one page at a time. The Session 
 | Replace on open, resync, or gap repair | Rebuild the loaded window, match every standard event or packed run once per Definition, then replay each started Context | `start`, followed by its updates in ascending logical `seq`; pending update-only Contexts remain without State |
 | Prepend one older page | Match only fresh older inputs, merge them into Contexts by `(kind, id)`, preserve existing keyed nodes, and replay only affected Contexts and dependencies | A newly found scalar start activates its collected scalar and packed updates; a changed Location or predecessor may rerun the Context |
 | Append one live event | Call each Definition's `match` once, look up the matched Context by key, and update only that Context | One scalar `update` and one requested publication for a matching post-start event; no existing Context scan |
+| Incremental flush failure | Replay the complete loaded window into new Contexts, replace every active view, and throw `ConversationUpdateError` with `rebuilt: true`; if the rebuild or replacement also fails, throw `rebuilt: false` and retry it on the next flush | Every Context replays as on replace. A Definition that fails on every incremental update makes each publication replay the whole window. Immediate publications report the error through the event-feed subscriber log; animation-frame publications report it from the frame callback |
 
 With `D` registered Definitions, one incoming scalar event or packed run performs `D` current-input matches and constant-time Context-key lookup after a match. Definition code must preserve that property: do not traverse the complete event window, every Context, `context.matches`, or the rendered Node collection on the normal append path. Use State for accumulated facts, Location data for same-Turn/Step sharing, and `reader.previous()` for indexed predecessor dependencies.
 
@@ -281,5 +298,6 @@ Add focused tests that establish these outcomes:
 6. The keyed renderer consumes `node.data` and constrained Location hooks only; it does not scan the Session event window, Contexts, or Chat Nodes.
 7. Scalar and packed Assistant history produce the same final State, timing boundaries, and target snapshot, while one packed run remains one Match through replace, prepend, Location replay, and registry rebuild.
 8. Creating a target source performs no builder work; explicit selection or the first subscription performs one complete replacement, later updates reach every active target, and repeated activation performs no replacement.
+9. A Definition that throws during an incremental flush leaves every active target showing a complete rebuild of the loaded window, and later events keep updating it.
 
 Use [`packages/client/ui-chat/src/client/conversation-nodes/assistant.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/assistant.ts) for streaming and interruption, [`inbox.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/inbox.ts) plus [`message.ts`](../../packages/client/ui-chat/src/client/conversation-nodes/message.ts) for predecessor queries, and [`packages/client/ui-deliverables`](../../packages/client/ui-deliverables) for a Definition that publishes Turn data without creating its own Node.

@@ -1,5 +1,5 @@
 // Shared plumbing for the web smoke tests (dist location, free port, failure shots).
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -12,7 +12,48 @@ export const DIST_INDEX = fileURLToPath(new URL('../dist/index.html', import.met
 
 export const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
 
+/**
+ * Read the `meta.description` an experimental bundle's plugin page shows for one locale.
+ * @param bundle - Package directory under `packages/experimental`.
+ * @param locale - Locale resource name, such as `en` or `zh`.
+ * @returns The description text from `locale/<locale>.json`.
+ */
+export function experimentalBundleDescription(bundle: string, locale: string): string {
+  const resource = JSON.parse(readFileSync(join(REPO_ROOT, 'packages/experimental', bundle, 'locale', `${locale}.json`), 'utf8')) as { meta: { description: string } }
+  return resource.meta.description
+}
+
 const installationRequire = createRequire(join(REPO_ROOT, 'apps/cli/package.json'))
+
+/**
+ * Check the shared warning title, theme color, and compact body alignment.
+ * @param dialog - visible warning dialog under test.
+ */
+export async function assertWarningDialogLayout(dialog: Locator): Promise<void> {
+  const layout = await dialog.evaluate((element) => {
+    const title = element.querySelector('h2')!
+    const icon = title.querySelector('svg')!
+    const paragraph = element.querySelector('p')!
+    const titleRect = title.getBoundingClientRect()
+    const bodyRect = paragraph.getBoundingClientRect()
+    const color = getComputedStyle(icon).color
+    const previous = icon.style.color
+    icon.style.color = 'var(--dsw-alias-state-warn-primary)'
+    const warningColor = getComputedStyle(icon).color
+    icon.style.color = previous
+    return {
+      decorative: icon.getAttribute('aria-hidden'),
+      matchesWarningColor: color === warningColor,
+      leftGap: Math.abs(bodyRect.left - titleRect.left),
+      topGap: bodyRect.top - titleRect.bottom,
+    }
+  })
+  expect(layout.decorative).toBe('true')
+  expect(layout.matchesWarningColor).toBe(true)
+  expect(layout.leftGap).toBeLessThan(1)
+  expect(layout.topGap).toBeGreaterThanOrEqual(0)
+  expect(layout.topGap).toBeLessThanOrEqual(16)
+}
 
 /**
  * The built copy of a workspace package, as the dsh installation resolves it.
@@ -41,8 +82,14 @@ export const ZH_BROWSER_LOCALE = 'zh-CN'
 /** Same-day anchor for seeded event times and the Asia/Shanghai browser clock. */
 export const WEB_FIXTURE_TIME = Date.parse('2026-01-15T12:00:00+08:00')
 
-/** How often a pinned browser clock advances, in milliseconds. */
-const PINNED_CLOCK_STEP_MS = 250
+/**
+ * Budget for a plugin-manager switch to republish its state after a click: the
+ * click starts a Host profile write, and the store's follow-up `load()` re-reads
+ * its inventory before the switch shows the new value. That chain measured
+ * 0.5-0.8 s on an idle host and 2.0-4.8 s across 32 samples in a 16-worker lane,
+ * so Vitest's 1-second `expect.poll` default expires first.
+ */
+export const PLUGIN_TOGGLE_SETTLE_MS = 10_000
 
 /**
  * Pin the Host clock to the shared fixture day for one scenario suite.
@@ -65,31 +112,36 @@ export function pinHostClock(): MockInstance<typeof Date.now> {
 }
 
 /**
- * Pin a scenario page's clock to the shared fixture day, advancing with real
+ * Pin a scenario page's calendar to the shared fixture day, advancing with real
  * time. Pair it with {@link pinHostClock} for a scenario that stamps its own
  * message times, and with `seedSession`'s `createdAt` for a seeded one.
  *
- * The frozen instant is re-applied from the anchor on an interval rather than
- * left at one value, because product logic reads two `Date.now()` values to
- * decide a minimum display hold or a deadline window; a permanently frozen
- * clock stops supplying elapsed time, so a title that owes its golden settled
- * text keeps rendering its previous one. Both clocks therefore advance at the
- * real rate and stay within one step of each other.
- * @param page - page whose clock is pinned.
- * @returns the disposer that stops re-pinning; call it in teardown.
+ * Only the page's `Date` reads the fixture day; native timers and
+ * `requestAnimationFrame` keep their real scheduling. Playwright's
+ * `page.clock` is not used: its server records clock state with the Vitest
+ * worker's `Date.now`, which {@link pinHostClock} replaces, so after a
+ * navigation the page clock replays the gap between the real and fixture days
+ * and hands the resulting negative delay to native `setTimeout`. The browser
+ * truncates that delay to a 32-bit integer, and in about half of the dates the
+ * result is a positive delay of weeks that stops every page timer. The `Date`
+ * override is installed for every later document and on the current one, and
+ * stays until the page closes.
+ * @param page - page whose calendar is pinned.
  */
-export async function pinBrowserClock(page: Page): Promise<() => void> {
-  const startedAt = Date.now()
-  const step = async (): Promise<void> => {
-    try {
-      await page.clock.setFixedTime(WEB_FIXTURE_TIME + (Date.now() - startedAt))
-    } catch {
-      // The page closed under the interval; teardown owns the last word.
-    }
+export async function pinBrowserClock(page: Page): Promise<void> {
+  // The worker's `new Date()` keeps the real clock even when `Date.now` is pinned.
+  const offset = WEB_FIXTURE_TIME - new Date().getTime()
+  const install = (offset: number): void => {
+    const NativeDate = Date
+    const now = (): number => NativeDate.now() + offset
+    globalThis.Date = new Proxy(NativeDate, {
+      construct: (target, args, newTarget): Date => Reflect.construct(target, args.length === 0 ? [now()] : args, newTarget) as Date,
+      apply: () => new NativeDate(now()).toString(),
+      get: (target, property, receiver): unknown => property === 'now' ? now : Reflect.get(target, property, receiver),
+    })
   }
-  await step()
-  const timer = setInterval(() => { void step() }, PINNED_CLOCK_STEP_MS)
-  return () => { clearInterval(timer) }
+  await page.addInitScript(install, offset)
+  await page.evaluate(install, offset)
 }
 
 /**
@@ -179,6 +231,23 @@ export function probeFreePort(): Promise<number> {
 }
 
 /**
+ * Open collapsed mobile navigation before using a sidebar action.
+ * @param page - browser page with the mounted sidebar.
+ * @param locale - current UI language.
+ */
+export async function revealNavigationDrawer(page: Page, locale: 'en' | 'zh' | 'ja'): Promise<void> {
+  const drawer = await page.evaluate(() => window.innerWidth < 768
+    && !document.documentElement.hasAttribute('data-windows-titlebar'))
+  await page.waitForFunction(expected => Boolean(document.querySelector('[data-sidebar-drawer]')) === expected, drawer)
+  const closed = page.locator('[data-sidebar-drawer][data-sidebar-collapsed]')
+  if (await closed.count() === 0) return
+  await page.locator('[data-shell-leading]').getByRole('button', {
+    name: { en: 'Open sidebar', zh: '打开侧边栏', ja: 'サイドバーを開く' }[locale], exact: true,
+  }).click()
+  await closed.waitFor({ state: 'detached' })
+}
+
+/**
  * Drive the hero's workspace picker through the composed directory dialog
  * until the live composer unlocks. A fresh world has no Workspace, so the boot
  * lands in the Workspace-trigger view state (startup auto-selection has nothing to
@@ -197,7 +266,8 @@ export function probeFreePort(): Promise<number> {
  */
 export async function connectFreshWorkspace(page: Page, root: string, name = 'workspace'): Promise<void> {
   mkdirSync(join(root, name), { recursive: true })
-  await page.getByRole('textbox', { name: 'Choose workspace' }).click()
+  await revealNavigationDrawer(page, 'en')
+  await page.getByRole('button', { name: 'Add workspace', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: 'Select Workspace Directory' })
   await dialog.waitFor({ timeout: 10_000 })
   await dialog.getByRole('button', { name: 'Edit path' }).click()
@@ -223,7 +293,8 @@ export async function connectFreshWorkspace(page: Page, root: string, name = 'wo
  */
 export async function connectFreshWorkspaceZh(page: Page, root: string, name = 'workspace', modelAvailable = true): Promise<void> {
   mkdirSync(join(root, name), { recursive: true })
-  await page.getByRole('textbox', { name: '选择工作区' }).click()
+  await revealNavigationDrawer(page, 'zh')
+  await page.getByRole('button', { name: '添加工作区', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '选择工作区目录' })
   await dialog.waitFor({ timeout: 10_000 })
   await dialog.getByRole('button', { name: '编辑路径' }).click()
@@ -318,16 +389,20 @@ export function conversationContextKey(kind: string, id: string): string {
   return `${kind.length}:${kind}${id}`
 }
 
-/** Open Settings through the Web gear or Desktop account menu.
+/** Open Settings through the sidebar account menu.
  * @param page - browser page with the mounted sidebar.
  * @param locale - current UI language.
  */
-export async function openSettings(page: Page, locale: 'en' | 'zh'): Promise<void> {
-  const label = locale === 'zh' ? '设置' : 'Settings'
-  if (await page.evaluate(() => 'dshDesktop' in globalThis)) {
-    await page.getByRole('button', { name: locale === 'zh' ? '账号菜单' : 'Account menu', exact: true }).click()
-    await page.getByRole('menuitem', { name: label, exact: true }).click()
-  } else {
-    await page.getByRole('button', { name: label, exact: true }).click()
+export async function openSettings(page: Page, locale: 'en' | 'zh' | 'ja'): Promise<void> {
+  const labels = { en: ['Account menu', 'Settings'], zh: ['账号菜单', '设置'], ja: ['アカウントメニュー', '設定'] } as const
+  const trigger = page.getByRole('button', {
+    name: labels[locale][0], exact: true, includeHidden: true,
+  })
+  await trigger.waitFor({ state: 'attached' })
+  await revealNavigationDrawer(page, locale)
+  if (!await trigger.isVisible()) {
+    await page.getByRole('button', { name: { en: 'Open sidebar', zh: '打开侧边栏', ja: 'サイドバーを開く' }[locale], exact: true }).click()
   }
+  await trigger.click()
+  await page.getByRole('menuitem', { name: labels[locale][1], exact: true }).click()
 }

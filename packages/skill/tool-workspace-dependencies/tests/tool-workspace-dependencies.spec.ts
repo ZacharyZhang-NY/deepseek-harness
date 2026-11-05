@@ -1,5 +1,7 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import * as fs from 'node:fs/promises'
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -9,11 +11,12 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import z from '@deepseek-ai/schemastery'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import * as workspaceDependencies from '../src/index.ts'
-import { installPrimaryRuntime, parsePrimaryRuntime, readPrimaryRuntime, resolvePrimaryRuntime, workspaceDependencyPaths, type PrimaryRuntimeManifest } from '../src/index.ts'
+import { copyPrimaryRuntime, installPrimaryRuntime, parsePrimaryRuntime, readPrimaryRuntime, resolvePrimaryRuntime, workspaceDependencyPaths, type PrimaryRuntimeManifest } from '../src/index.ts'
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof fs>()
@@ -65,6 +68,58 @@ it('installs offline, reuses the same release, and leaves environment and user p
   expect(installed.pythonDistributions).toEqual(manifest.pythonPackages)
   expect(await readFile(join(installed.pythonPackages, 'user-package.py'), 'utf8')).toBe('user content')
   expect(process.env).toEqual(environment)
+})
+
+// Windows installations use python.exe; this upgrade needs the native POSIX alias layout.
+it.skipIf(process.platform === 'win32')('upgrades expanded Python commands to relocatable aliases and reuses the installed payload', async () => {
+  const { source, root, manifest, directory } = await fixture()
+  await installPrimaryRuntime(source, root)
+  const bin = dirname(workspaceDependencyPaths(source, manifest).python)
+  await rename(join(bin, 'python3'), join(bin, 'python3.12'))
+  for (const name of ['python', 'python3']) await symlink('python3.12', join(bin, name))
+  await writeFile(join(source, 'runtime.json'), JSON.stringify({ ...manifest, payloadDigest: 'a'.repeat(64) }))
+  const installed = await installPrimaryRuntime(source, root)
+  await writeFile(join(installed.pythonPackages, 'user.py'), 'user package')
+  expect(await installPrimaryRuntime(source, root)).toEqual(installed)
+  expect(await readFile(join(installed.pythonPackages, 'user.py'), 'utf8')).toBe('user package')
+  const moved = join(directory, 'moved runtime with spaces')
+  await rename(root, moved)
+  await rm(source, { recursive: true })
+  const relocatedBin = dirname((await resolvePrimaryRuntime(moved)).python)
+  expect((await lstat(join(relocatedBin, 'python3.12'))).isFile()).toBe(true)
+  for (const name of ['python', 'python3']) {
+    expect(await readlink(join(relocatedBin, name))).toBe('python3.12')
+    expect(await readFile(join(relocatedBin, name), 'utf8')).toBe('interpreter')
+  }
+})
+
+// These entry-point checks install real POSIX aliases; Windows payloads have no such entries.
+it.skipIf(process.platform === 'win32').each(['copy', 'reuse', 'in-place'] as const)('rejects escaping Python aliases during %s preparation', async (mode) => {
+  const { source, root, manifest } = await fixture()
+  if (mode === 'reuse') await installPrimaryRuntime(source, root)
+  const payload = mode === 'reuse' ? root : source
+  const python = workspaceDependencyPaths(payload, manifest).python
+  await rename(python, join(dirname(dirname(python)), 'outside-python'))
+  await symlink('../outside-python', python)
+  const operation = mode === 'in-place' ? resolvePrimaryRuntime(source) : installPrimaryRuntime(source, root)
+  await expect(operation).rejects.toThrow('invalid Python alias')
+})
+
+it('copies Windows payloads without creating interpreter aliases', async () => {
+  const { source, root, manifest } = await fixture()
+  const windows = { ...manifest, platform: 'win32' }
+  const python = workspaceDependencyPaths(source, windows).python
+  await writeFile(python, 'Windows interpreter')
+  await copyPrimaryRuntime(source, root, windows)
+  expect(await readFile(workspaceDependencyPaths(root, windows).python, 'utf8')).toBe('Windows interpreter')
+  expect((await lstat(workspaceDependencyPaths(root, windows).python)).isFile()).toBe(true)
+})
+
+it('propagates an unreadable alias without creating a partial payload', async () => {
+  const { source, root, manifest } = await fixture()
+  vi.mocked(fs.lstat).mockRejectedValueOnce(Object.assign(new Error('alias denied'), { code: 'EACCES' }))
+  await expect(copyPrimaryRuntime(source, root, { ...manifest, platform: 'linux' })).rejects.toThrow('alias denied')
+  await expect(readFile(join(root, 'runtime.json'))).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
 it('replaces release components and recovers an interrupted directory swap', async () => {
@@ -197,16 +252,17 @@ it('loads the real tool through Cordis, exposes payload paths in place, and unre
     await ctx.plugin(Loader)
     ctx.loader.builtins.include = Include
     Object.assign(ctx.loader.builtins, {
-      agents: AgentRegistry, systemPrompt: SystemPrompt, tools: ToolRuntime, dependencies: workspaceDependencies,
+      agents: AgentRegistry, systemPrompt: SystemPrompt, tools: ToolRuntime,
+      toolExecutor: NativeToolExecutor, dependencies: workspaceDependencies,
     })
     const config = join(directory, 'cordis.yml')
-    await writeFile(config, `- name: cordis:agents\n- name: cordis:systemPrompt\n- name: cordis:tools\n- name: cordis:dependencies\n  config:\n    source: ${JSON.stringify(source)}\n`)
+    await writeFile(config, `- name: cordis:agents\n- name: cordis:systemPrompt\n- name: cordis:tools\n- name: cordis:toolExecutor\n- name: cordis:dependencies\n  config:\n    source: ${JSON.stringify(source)}\n`)
     await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(config).href } })
     await ctx.loader.await()
     for (const entry of ctx.loader.entries()) await entry.fiber?.await()
     const environment = { ...process.env }
     const request = { signal: new AbortController().signal, name: 'load_workspace_dependencies', arguments: {} }
-    const results = await Promise.all(['first', 'second'].map(id => ctx.tools.execute({ ...request, callId: ToolCallId(id) })))
+    const results = await Promise.all(['first', 'second'].map(id => executeToolFixture(ctx, { ...request, callId: ToolCallId(id) })))
     for (const result of results) {
       expect(result.isError).toBe(false)
       expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(workspaceDependencyPaths(source, manifest), undefined, 2) }])
@@ -250,12 +306,14 @@ it('rejects a payload whose Node.js or pnpm version is malformed', async () => {
 async function tool(config: workspaceDependencies.Config) {
   const ctx = new Context()
   try {
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     const fiber = ctx.plugin(workspaceDependencies, config)
     await fiber
-    const execute = () => ctx.tools.execute({
+    const execute = () => executeToolFixture(ctx, {
       signal: new AbortController().signal, name: 'load_workspace_dependencies',
       arguments: {}, callId: ToolCallId('dependencies'),
     })

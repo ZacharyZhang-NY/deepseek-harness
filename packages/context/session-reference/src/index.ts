@@ -10,7 +10,7 @@ import z from '@deepseek-ai/schemastery'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createUserMessage, freezeMessage, LlmError } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, LlmResolvedModelInfo, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmCallConfig, LlmResolvedModelInfo, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 // Type-only: the `title` projection key plus the live registry and durable
 // cache Context merges — the two projection faces discovery labels from.
@@ -63,6 +63,9 @@ ${REFERENCE_WARNING}
 `
 const PROMPT_SUFFIX = '\n</referenced-sessions>'
 
+/** Projection keys a discovery label is answered from. */
+const LABEL_KEYS = ['title', 'subagent'] as const
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     sessionReferenceResolver: SessionReferenceResolver
@@ -92,7 +95,6 @@ export class SessionReferenceResolver extends TypertRemoteService {
   })
 
   private readonly config: Required<Omit<Config, 'maxReferenceBytes'>> & { maxReferenceBytes: number | undefined }
-  private readonly assembledRoutes = new WeakMap<Agent, { provider: string | undefined; model: string | undefined }>()
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'sessionReferenceResolver')
@@ -123,21 +125,12 @@ export class SessionReferenceResolver extends TypertRemoteService {
         'SESSION_REFERENCE_INVALID_CONFIG',
       )
     }
-    // Prepend observes model-selection overrides after downstream assembly completes.
-    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
-      const assembly = await next()
-      if (context.agent !== undefined) {
-        const { provider, model } = assembly.variables
-        this.assembledRoutes.set(context.agent, { provider, model })
-      }
-      return assembly
-    }, { prepend: true })
-    ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecision> => {
+    ctx.on('agent/pre-step', async ({ agent, signal, modelSelection }, next): Promise<PreStepDecision> => {
       const decision = await next()
       if (decision.kind === 'reject') return decision
       return {
         ...decision,
-        messages: await this.prepareDirectMessages(agent, decision.messages, signal),
+        messages: await this.prepareDirectMessages(agent, decision.messages, modelSelection, signal),
       }
     }, { prepend: true })
   }
@@ -147,12 +140,14 @@ export class SessionReferenceResolver extends TypertRemoteService {
    * snapshot immediately after the message that cited it.
    * @param agent - agent entering the model step.
    * @param messages - messages accepted by downstream pre-step listeners.
+   * @param route - provider and model fixed for the step.
    * @param signal - active turn cancellation.
    * @returns direct messages followed by their session-reference context in citation order.
    */
   private async prepareDirectMessages(
     agent: Agent,
     messages: readonly UserMessage[],
+    route: Readonly<Pick<LlmCallConfig, 'provider' | 'model'>>,
     signal: AbortSignal,
   ): Promise<UserMessage[]> {
     const prepared = await Promise.all(messages.map(async (message): Promise<UserMessage[]> => {
@@ -165,7 +160,7 @@ export class SessionReferenceResolver extends TypertRemoteService {
         return { type: 'text', text: parsed.text }
       })
       if (references.length === 0) return [message]
-      const resolved = await this.prepare(agent, content, references, signal)
+      const resolved = await this.prepare(agent, content, references, route, signal)
       const direct = freezeMessage({ ...message, content: resolved.content })
       /* v8 ignore if -- a parsed canonical mention always leaves one normalized reference */
       if (resolved.additionalContext === undefined) {
@@ -202,7 +197,7 @@ export class SessionReferenceResolver extends TypertRemoteService {
     const records = (await settleWithCancellation(this.ctx.sessionQuery.listSessions(signal), signal))
       .filter(record => record.header.id !== agent.id)
       .map((record, index) => ({ record, index }))
-    const labelled = records.map(({ record, index }) => ({ record, index, ...this.projectedLabels(record) }))
+    const labelled = this.projectedLabels(records)
     return labelled.filter(({ record, label, displayTitle }) => {
       if (needle === '') return true
       return record.header.id.toLocaleLowerCase().includes(needle)
@@ -223,7 +218,7 @@ export class SessionReferenceResolver extends TypertRemoteService {
   }
 
   /**
-   * The mention label and display title a Session's projections can answer without reading its log.
+   * The mention label and display title each listed Session's projections can answer without reading its log.
    *
    * Attachment is decided by the store at read time, not by the listing:
    * a session that attached in between would otherwise be answered from a
@@ -240,23 +235,38 @@ export class SessionReferenceResolver extends TypertRemoteService {
    * session that no projection can answer for — one persisted before the
    * cache was composed — is labeled by its id and cannot be found by its
    * title until it is opened once, which checkpoints it.
-   * @param record - the listed session, live or cold.
-   * @returns the title-backed mention label and the subagent-label-first display title.
+   *
+   * Services are resolved once per call and the cache's snapshot method is
+   * bound once: a service lookup per listed session would dominate the call.
+   * @param items - the listed sessions, live or cold.
+   * @returns each item with its title-backed mention label and subagent-label-first display title.
    */
-  private projectedLabels(record: SessionRecord): { label: string; displayTitle: string } {
-    const attached = this.ctx.get('sessions')?.get(record.header.id)
+  private projectedLabels<T extends { readonly record: SessionRecord }>(
+    items: readonly T[],
+  ): Array<T & { label: string; displayTitle: string }> {
     const projections = this.ctx.get('sessionProjections')
-    const snapshot = attached !== undefined && projections !== undefined
-      ? projections.snapshot(attached, ['title', 'subagent'])
-      : this.ctx.get('sessionProjectionCache')?.cachedSnapshot(record.header, ['title', 'subagent'])
-    const label = titleOf(snapshot) ?? record.header.id
-    const subagent = snapshot?.values.subagent
-    return {
-      label,
-      displayTitle: subagent === undefined || subagent === null
-        ? label
-        : subagent.label ?? label,
-    }
+    const sessions = this.ctx.get('sessions')
+    // An attached session answers from its live cut only while the registry is mounted.
+    const attached = new Map(sessions === undefined || projections === undefined
+      ? undefined
+      : sessions.list().map(session => [session.id, session]))
+    const cache = this.ctx.get('sessionProjectionCache')
+    const cachedSnapshot = cache?.cachedSnapshot.bind(cache)
+    return items.map((item) => {
+      const session = attached.get(item.record.header.id)
+      const snapshot = session !== undefined && projections !== undefined
+        ? projections.snapshot(session, LABEL_KEYS)
+        : cachedSnapshot?.(item.record.header, LABEL_KEYS)
+      const label = titleOf(snapshot) ?? item.record.header.id
+      const subagent = snapshot?.values.subagent
+      return {
+        ...item,
+        label,
+        displayTitle: subagent === undefined || subagent === null
+          ? label
+          : subagent.label ?? label,
+      }
+    })
   }
 
   /**
@@ -286,13 +296,14 @@ export class SessionReferenceResolver extends TypertRemoteService {
 
   /**
    * Snapshot all references for one accepted direct message and return one aggregated durable context.
-   * Automatic budgets use the last assembled route, or agent options before any assembly.
+   * Automatic budgets use the context capacity of `route`.
    * Missing model capacity or adapter uses 64 KiB; other metadata lookup failures and cancellation reject preparation.
    * Truncated previews include omission facts and a full-snapshot spill locator, or an explicit unavailable notice.
    * Cancellation prevents context publication, including when storage completes after cancellation.
    * @param agent - target agent; references to it are rejected.
    * @param content - already host-normalized readable message content.
    * @param references - structured source sessions in mention order.
+   * @param route - provider and model whose context capacity sizes the previews.
    * @param signal - optional cancellation boundary for the active turn.
    * @returns detached content and optional referenced-session context.
    */
@@ -300,13 +311,14 @@ export class SessionReferenceResolver extends TypertRemoteService {
     agent: Agent,
     content: ContentBlock[],
     references: SessionReferenceInput[],
+    route: Readonly<Pick<LlmCallConfig, 'provider' | 'model'>>,
     signal?: AbortSignal,
   ): Promise<PreparedReferencedMessage> {
     const acceptedContent = structuredClone(content)
     const inputs = normalizeReferences(agent.id, references, this.config.maxReferences)
     if (inputs.length === 0) return { content: acceptedContent }
     assertNotCancelled(signal)
-    const maxReferenceBytes = await this.referenceBudget(agent, signal)
+    const maxReferenceBytes = await this.referenceBudget(route, signal)
     assertNotCancelled(signal)
     let prepared: PreparedSource[]
     try {
@@ -357,12 +369,11 @@ export class SessionReferenceResolver extends TypertRemoteService {
     return { content: acceptedContent, additionalContext }
   }
 
-  private async referenceBudget(agent: Agent, signal: AbortSignal | undefined): Promise<number> {
+  private async referenceBudget(route: Readonly<Pick<LlmCallConfig, 'provider' | 'model'>>, signal: AbortSignal | undefined): Promise<number> {
     if (this.config.maxReferenceBytes !== undefined) return this.config.maxReferenceBytes
-    // Options seed direct preparation; an assembled route owns model-step preparation.
-    const { provider, model } = this.assembledRoutes.get(agent) ?? agent.options
+    const { provider, model } = route
     const llm = this.ctx.get('llm')
-    if (provider === undefined || model === undefined || llm === undefined) return DEFAULT_MAX_REFERENCE_BYTES
+    if (llm === undefined) return DEFAULT_MAX_REFERENCE_BYTES
     let info: LlmResolvedModelInfo
     try {
       info = await settleWithCancellation(llm.resolveModelInfo(provider, model, signal), signal)

@@ -5,8 +5,9 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionTitleService, { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
 
 const CONFIG = {
@@ -68,6 +69,7 @@ describe('session title persistence round trips', () => {
     const writer = new Context()
     await writer.plugin(SessionStore)
     await writer.plugin(SessionProjectionRegistry)
+    await writer.plugin(AgentRegistry)
     await writer.plugin(JsonlSessionPersistence, { root, compression: 'none' })
     await writer.plugin(SessionTitleService, CONFIG)
     await appendPersistedTitle(writer, id)

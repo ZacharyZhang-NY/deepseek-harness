@@ -27,8 +27,8 @@
   en: 2d300cdb883352ec
   zh: 5a81be005b3716d3
 /deepseek-ai-dsh-plan-mode/use-this-package/the-reviewed-exit:
-  en: ffc56477380b9411
-  zh: 17cac060f2252d78
+  en: dbf12997d2359e81
+  zh: 120a91554d2154f4
 /deepseek-ai-dsh-plan-mode/use-this-package/observing-plan-state:
   en: b44e92bc38406015
   zh: ed56190bee5d71a4
@@ -39,23 +39,23 @@
   en: 0acc88b042a99380
   zh: e4cf66b77f2fc7ae
 /deepseek-ai-dsh-plan-mode/understand-the-implementation/durable-state-and-step-boundary-appends:
-  en: ff946ab59a7b4a0f
-  zh: b1c79937770f57ad
+  en: 24166a02b6e81553
+  zh: 24313c2153c9a6a6
 /deepseek-ai-dsh-plan-mode/understand-the-implementation/the-plan-command:
   en: a7bf35c2a9da52bc
   zh: dea9f4b3a41f1a6d
 /deepseek-ai-dsh-plan-mode/understand-the-implementation/the-exit-tool:
-  en: 56798d0f45fb5775
-  zh: 282e4a522ce6dae0
+  en: 7736aea9e4934fa8
+  zh: a595e477f54a199e
 /deepseek-ai-dsh-plan-mode/understand-the-implementation/session-projection-unit:
-  en: 74cd6bdf50af51f5
-  zh: 67609cf7202ececb
+  en: 396d66816890f715
+  zh: fab5d67c027b33f5
 /deepseek-ai-dsh-plan-mode/understand-the-implementation/source-map:
-  en: 4ee4cfb5fceccdf1
-  zh: 12035b72e1996a55
+  en: fa97e858495a8105
+  zh: 8be1fbd7e420ff8a
 /deepseek-ai-dsh-plan-mode/further-exploration:
-  en: b6f3ce071f1b7e9b
-  zh: 84b7fe88e09866d8
+  en: 5008d6d632002f49
+  zh: 65184d489ecdcec0
 /deepseek-ai-dsh-plan-mode/model-experience:
   en: 215e7ba838619b7b
   zh: a311da3843709f90
@@ -90,17 +90,17 @@
   en: 9622e96bdc01276d
   zh: 53801e68a49f3d1d
 /deepseek-ai-dsh-plan-mode/model-experience/exit-tool-schema-and-review-exchange/what-the-model-sees:
-  en: 3768d0189f9f13af
-  zh: 2168a9b24551b7c6
+  en: 1b978a7b6eecdffe
+  zh: 338000d1bf8dd4a9
 /deepseek-ai-dsh-plan-mode/model-experience/exit-tool-schema-and-review-exchange/token-effect:
-  en: d1b1418f20ee119d
-  zh: c2b89ea3cae57175
+  en: 5ef9db72f91e4a8c
+  zh: 6e96335cc3eb5976
 /deepseek-ai-dsh-plan-mode/model-experience/exit-tool-schema-and-review-exchange/kv-cache-effect:
-  en: 6b1404ea11f1e60d
-  zh: 348d0579de218652
+  en: a9eb70ad541fcfd7
+  zh: 9c06d39341fc52b1
 /deepseek-ai-dsh-plan-mode/known-limitations-and-deferred-work:
-  en: a87aabfede0087fd
-  zh: 201e9b3766980005
+  en: fbcbb96ff2b1773b
+  zh: 57fcd1232879c3ee
 /deepseek-ai-dsh-plan-mode/known-limitations-and-deferred-work/dev-note:
   en: 7de02cd33a767bd6
   zh: d9e54003f230f725

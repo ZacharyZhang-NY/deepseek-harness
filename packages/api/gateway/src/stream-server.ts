@@ -3,7 +3,7 @@
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { Deque } from '@deepseek-ai/dsh-deque'
-import { RemoteError, remoteErrorOf, type PeerScope } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError, remoteErrorOf, type PeerScope, type RemoteUplinkWindow } from '@deepseek-ai/dsh-typert-protocol'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
 import {
   parseRemoteStreamClientMessage,
@@ -16,7 +16,7 @@ import {
  * Open one validated Remote stream for a decoded wire request on behalf of one
  * Peer. `uplink` carries the Client's items; `control` cancels the logical
  * stream, and aborting it with a Remote failure as the reason delivers that
- * failure to the Client.
+ * failure to the Client. `window` describes this stream's complete-frame inbox budget.
  */
 export type RemoteStreamOpener = (
   endpoint: string,
@@ -24,6 +24,7 @@ export type RemoteStreamOpener = (
   uplink: AsyncIterable<unknown>,
   peer: PeerScope,
   control: AbortController,
+  window: RemoteUplinkWindow,
 ) => Promise<AsyncIterable<unknown>>
 
 /** The opener one socket uses: its Peer is fixed at upgrade time. */
@@ -32,6 +33,7 @@ type BoundStreamOpener = (
   payload: unknown,
   uplink: AsyncIterable<unknown>,
   control: AbortController,
+  window: RemoteUplinkWindow,
 ) => Promise<AsyncIterable<unknown>>
 
 /** Convert an invocation or carrier failure to a stable wire value. */
@@ -39,9 +41,22 @@ export type RemoteStreamFailureMapper = (error: unknown) => RemoteStreamFailure
 
 const MAX_MISSED_HEARTBEATS = 2
 
+/** Carrier options for {@link RemoteStreamMuxServer}. */
+export interface RemoteStreamMuxServerOptions {
+  /** Interval between WebSocket Ping control frames. */
+  readonly heartbeatIntervalMs: number
+  /** Buffered uplink frame bytes one logical stream may hold before it fails. */
+  readonly streamInboxBytes: number
+  /** Whether accepted connections negotiate the `permessage-deflate` extension. */
+  readonly compression: boolean
+}
+
 /** Own the no-server WebSocket acceptor and every active logical stream. */
 export class RemoteStreamMuxServer {
-  private readonly server = new WebSocketServer({ noServer: true })
+  private readonly server: WebSocketServer
+  private readonly heartbeatIntervalMs: number
+  private readonly streamInboxBytes: number
+  private readonly compression: boolean
   private readonly connections = new Set<Promise<void>>()
   private readonly missedHeartbeats = new WeakMap<WebSocket, number>()
   private heartbeatTimer: NodeJS.Timeout | undefined
@@ -49,15 +64,23 @@ export class RemoteStreamMuxServer {
   /**
    * @param open - Gateway stream dispatcher.
    * @param failure - Gateway error-to-wire mapper.
-   * @param heartbeatIntervalMs - interval between WebSocket Ping control frames.
-   * @param streamInboxBytes - buffered uplink frame bytes one logical stream may hold before it fails.
+   * @param options - heartbeat interval, uplink inbox bound, and compression setting for accepted connections.
    */
   constructor(
     private readonly open: RemoteStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
-    private readonly heartbeatIntervalMs: number,
-    private readonly streamInboxBytes: number,
-  ) {}
+    options: RemoteStreamMuxServerOptions,
+  ) {
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs
+    this.streamInboxBytes = options.streamInboxBytes
+    this.compression = options.compression
+    this.server = new WebSocketServer({
+      noServer: true,
+      // `ws` ignores its own `threshold` option while context takeover is
+      // enabled, so the mux decides per frame in send().
+      perMessageDeflate: options.compression ? { zlibDeflateOptions: { level: 1 } } : false,
+    })
+  }
 
   /**
    * Upgrade one admitted request and begin serving its logical streams. Every
@@ -72,18 +95,21 @@ export class RemoteStreamMuxServer {
     this.server.handleUpgrade(req, socket, head, (websocket) => {
       const release = bindPeer(websocket, peer)
       if (release === undefined) return
-      this.missedHeartbeats.set(websocket, 0)
-      websocket.on('pong', () => { this.missedHeartbeats.set(websocket, 0) })
+      const alive = (): void => { this.missedHeartbeats.set(websocket, 0) }
+      alive()
       this.startHeartbeat()
-      const bound: BoundStreamOpener = (endpoint, payload, uplink, control) =>
-        this.open(endpoint, payload, uplink, peer, control)
-      const connection = new RemoteStreamMuxConnection(websocket, bound, this.failure, this.streamInboxBytes)
-      const done = connection.run()
-      this.connections.add(done)
-      void done.then(() => {
-        this.connections.delete(done)
-        void release()
+      const bound: BoundStreamOpener = (endpoint, payload, uplink, control, window) =>
+        this.open(endpoint, payload, uplink, peer, control, window)
+      const connection = new RemoteStreamMuxConnection(
+        websocket, bound, this.failure, this.streamInboxBytes, this.compression, alive,
+      )
+      const done = connection.run().catch((error: unknown) => {
+        console.error('[api-gateway] Remote stream connection failed:', error)
+      }).then(async () => { await release() }).catch((error: unknown) => {
+        console.error('[api-gateway] Remote stream scope cleanup failed:', error)
       })
+      this.connections.add(done)
+      void done.then(() => { this.connections.delete(done) })
     })
   }
 
@@ -141,13 +167,25 @@ class RemoteStreamMuxConnection {
     private readonly open: BoundStreamOpener,
     private readonly failure: RemoteStreamFailureMapper,
     private readonly streamInboxBytes: number,
+    private readonly compression: boolean,
+    private readonly alive: () => void,
   ) {}
 
+  /**
+   * Serve frames until the socket closes. A Pong, any received frame, and a
+   * downlink write that does not complete at once count as peer activity, so
+   * a congested link that delays the Pong behind data keeps its socket. A
+   * frame above the compression threshold deflates asynchronously, so its
+   * completion always counts; a write that completes at once proves nothing
+   * about the peer and does not count.
+   */
   async run(): Promise<void> {
     const closed = new Promise<void>((resolve) => {
       this.socket.once('close', resolve)
       this.socket.once('error', () => { this.socket.terminate() })
+      this.socket.on('pong', this.alive)
       this.socket.on('message', (data, isBinary) => {
+        this.alive()
         if (isBinary) {
           this.socket.close(1003, 'text messages required')
           return
@@ -230,7 +268,10 @@ class RemoteStreamMuxConnection {
   ): Promise<void> {
     let outcome: { readonly failed: false } | { readonly failed: true; readonly error: unknown }
     try {
-      const source = await this.open(endpoint, payload, active.inbox, active.abort)
+      const source = await this.open(endpoint, payload, active.inbox, active.abort, {
+        maxBytes: this.streamInboxBytes,
+        frameOverheadBytes: Buffer.byteLength(JSON.stringify({ type: 'item', streamId, value: null }), 'utf8') - 'null'.length,
+      })
       for await (const value of source) {
         await this.send({ type: 'item', streamId, value })
       }
@@ -283,10 +324,22 @@ class RemoteStreamMuxConnection {
         reject(new Error('api gateway: Remote stream socket is closed'))
         return
       }
-      this.socket.send(text, (error) => {
-        if (error) reject(error)
-        else resolve()
+      let queued = false
+      this.socket.send(text, {
+        compress: this.compression && text.length >= 1024,
+      }, (error) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        if (queued) this.alive()
+        resolve()
       })
+      // Read after send(): buffered bytes mean the write did not complete at
+      // once, so its completion counts as peer activity. For a compressed frame
+      // the buffered bytes include ws's deflate queue, not just the TCP send
+      // buffer.
+      queued = this.socket.bufferedAmount > 0
     }))
     this.writes = delivery.catch(() => undefined)
     return delivery
@@ -430,8 +483,8 @@ function rawText(data: RawData): string {
  * @param socket - carrier socket that receives the HTTP rejection.
  * @param status - authentication or browser-trust rejection status.
  */
-export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403): void {
-  const reason = status === 401 ? 'Unauthorized' : 'Forbidden'
+export function rejectRemoteStreamUpgrade(socket: Duplex, status: 401 | 403 | 409): void {
+  const reason = status === 401 ? 'Unauthorized' : status === 403 ? 'Forbidden' : 'Conflict'
   const body = reason.toLowerCase()
   socket.end([
     `HTTP/1.1 ${String(status)} ${reason}`,

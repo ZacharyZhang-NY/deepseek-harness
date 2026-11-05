@@ -1,6 +1,8 @@
 /** Validate and capture the binding names available to one program. */
 import { DUNDER_MEMBER, PORTABLE_RESERVED_WORDS, RESERVED_BINDING_GLOBALS, RESERVED_ERROR_MEMBERS } from '@deepseek-ai/dsh-ptc-runtime'
-import type { PtcBindingNamespace, PtcRunRequest } from '@deepseek-ai/dsh-ptc-runtime'
+import type { PtcBindingFunction, PtcBindingNamespace, PtcJsonValue, PtcRunRequest } from '@deepseek-ai/dsh-ptc-runtime'
+import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
+import { encodePtcJsonWire, type PtcJsonWire } from './json-wire.ts'
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 /**
  * Reject unusable namespaces before starting a process.
@@ -48,4 +50,17 @@ export function validateBindings(request: PtcRunRequest): Map<string, PtcBinding
     errorClassNames.add(descriptor.name)
   }
   return bindings
+}
+
+/**
+ * Invoke a host binding and encode its lossless result.
+ * @param binding - Current evaluation's function, absent if it was removed.
+ * @param args - Validated JSON arguments detached from the program.
+ * @returns Flat lossless JSON; unavailable bindings and invalid results reject.
+ */
+export async function invokeBinding(binding: PtcBindingFunction | undefined, args: PtcJsonValue): Promise<PtcJsonWire> {
+  if (!binding) throw new Error('binding is unavailable in this evaluation; reacquire the current tool')
+  const value = snapshotJsonValue(await binding(args))
+  if (value === undefined) throw new Error('binding resolution must be lossless JSON')
+  return encodePtcJsonWire(value)
 }

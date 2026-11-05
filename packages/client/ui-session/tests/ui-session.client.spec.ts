@@ -10,6 +10,7 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import { MutableSessionEventSource } from '@deepseek-ai/dsh-api-session-controller/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { StaticRemoteAccess } from '@deepseek-ai/dsh-client-test-runtime'
 import type { HostObservable, RootStandardSourceContribution } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -715,25 +716,76 @@ describe('ui-session apply', () => {
     const slots = {
       provideRoot: vi.fn(),
       installScope: vi.fn(),
+      bindStoreScope: vi.fn(),
     }
+    const accessSources = new Map<string, HostObservable<boolean>>()
+    const remoteAccess = {
+      source: vi.fn((kind: string, id: string, action: string): HostObservable<boolean> => {
+        const key = `${kind}:${id}:${action}`
+        let source = accessSources.get(key)
+        if (source === undefined) {
+          source = createSnapshotStore(false)
+          accessSources.set(key, source)
+        }
+        return source
+      }),
+      whenAccess: vi.fn(() => () => {}),
+      whenResourceAccess: vi.fn((): () => void => stopGuard),
+    }
+    const stopGuard = vi.fn()
     ctx.provide('sessions', bench.sessions)
     ctx.provide('slots', slots as never)
+    ctx.provide('remoteAccess', remoteAccess)
 
     apply(ctx)
 
     expect(ctx.uiSession).toBeInstanceOf(UiSession)
     const retainInfoMatcher: unknown = expect.any(Function)
+    const sessionAccessMatcher: unknown = expect.any(Function)
     expect(slots.provideRoot).toHaveBeenCalledWith({
       hooks: {
         sessions: bench.sessions.list,
         sessionStatus: ctx.uiSession.sessionStatus,
       },
-      keyedHooks: { sessionRetainInfo: retainInfoMatcher },
+      keyedHooks: { sessionRetainInfo: retainInfoMatcher, sessionAccess: sessionAccessMatcher },
     })
     expect(slots.installScope).toHaveBeenCalledWith('session', ctx.uiSession.adapter)
     const root = slots.provideRoot.mock.calls[0]![0] as RootStandardSourceContribution
     expect(root.keyedHooks?.sessionRetainInfo?.(sessionId('s1')))
       .toBe(bench.retainInfo(sessionId('s1')))
+    // `useSessionAccess(sessionId, action)` reads the Session resource's answer; a call without an action names no source.
+    expect(root.keyedHooks?.sessionAccess?.(sessionId('s1'), 'session/fork'))
+      .toBe(remoteAccess.source('session', sessionId('s1'), 'session/fork'))
+    expect(root.keyedHooks?.sessionAccess?.(sessionId('s1'))).toBeUndefined()
+
+    // The Session scope's `useAccess(action)` reads the bound Session's answer from the same source.
+    const binding = bench.binding(sessionId('s2'))
+    const scoped = ctx.uiSession.bindingSource(bench.reference(binding)).getSnapshot()
+    expect(scoped.keyedHooks.access?.('session/fork')).toBe(remoteAccess.source('session', sessionId('s2'), 'session/fork'))
+
+    // `whenAccess` follows the same Session resource through the service's resource form.
+    const guarded = vi.fn(() => () => {})
+    expect(ctx.uiSession.whenAccess(sessionId('s1'), 'session/fork', guarded)).toBe(stopGuard)
+    expect(remoteAccess.whenResourceAccess).toHaveBeenCalledWith('session', sessionId('s1'), 'session/fork', guarded)
+  })
+
+  it('hangs Session-guarded effects on the calling plugin, so they leave when it unloads', async () => {
+    const ctx = new Context()
+    const bench = createSessionsBench(ctx)
+    ctx.provide('sessions', bench.sessions)
+    ctx.provide('slots', { provideRoot: vi.fn(), installScope: vi.fn(), bindStoreScope: vi.fn() } as never)
+    new StaticRemoteAccess(ctx)
+    apply(ctx)
+    const dispose = vi.fn()
+    const caller = ctx.plugin({
+      inject: ['uiSession'],
+      apply: (callerCtx: Context) => { callerCtx.uiSession.whenAccess(sessionId('s1'), 'session/fork', () => dispose) },
+    })
+    await caller.await()
+    expect(dispose).not.toHaveBeenCalled()
+    await caller.dispose()
+    expect(dispose).toHaveBeenCalledOnce()
+    await ctx.fiber.dispose()
   })
 
   it('keeps the Host loader half inert', () => {

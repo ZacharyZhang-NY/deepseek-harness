@@ -28,11 +28,11 @@ macOS 上，启动审计把一组 Web 客户端行列为 `import failed (see con
 
 ## 与既有决定的关系
 
-本 note 部分取代 [Desktop 原生致命恢复](2026-09-15-desktop-native-fatal-recovery.zh.md)：对话框指向的记录现在是崩溃报告文件而非 Electron 控制台，对话框详情多出报告路径一行；该 note 对对话框归属、按钮集合与 profile 恢复的决定仍然有效。`uncaughtException` 的处理把 [fail-loud release](../bug-fix/2026-07-31-fail-loud-releases-the-terminal.zh.md) note 的 release 机制扩展到同步抛出。
+本 note 部分取代 [Desktop 原生致命恢复](2026-09-15-desktop-native-fatal-recovery.zh.md)：对话框指向的记录现在是崩溃报告文件而非 Electron 控制台，对话框详情多出报告路径一行；该 note 对对话框归属、按钮集合与 profile 恢复的决定仍然有效。`uncaughtException` 的处理把 [fail-loud release](../../../../packages/boot/app-boot/README.zh.md) note 的 release 机制扩展到同步抛出。
 
 ## 与 Desktop 日志体系设计的关系
 
-Desktop 本地日志设计（Worker 独占写入的滚动 JSONL 日志、封闭事件词汇、脱敏与限流）是持续日志设计，仍是未来工作。它规定 Host stderr 与渲染进程 console 输出永不持久化、错误只以固定分类进入日志。本决定划出一个例外：致命失败的一次性崩溃报告保留原始错误以及保留的 stderr 与 console 尾部，因为两次现场定位需要的正是这些原始内容，而报告有界（error 段截至 256 KiB、Host 诊断 64 KiB、渲染进程 console 尾部 64 KiB）、本地、仅所有者可读，且只在应用已经弹出致命对话框时写入。对话框标明文件名，用户知道自己会分享什么。任何非崩溃报告的内容仍遵循持续日志的隐私姿态。
+Desktop 持续保存有界的插件管理日志，使用事实白名单、两个轮换文件段和有界写入队列；预算及失败保障由 [Desktop README](../../../../apps/desktop/README.zh.md) 定义。日志不包含原始安装 spec、错误文本或包管理器输出。更广泛的 Worker 独占持续日志仍属延期工作。致命崩溃报告独立保留原始错误以及有界的 stderr 和渲染进程 console 尾部，因为这些内容包含现场定位证据；文件保存在本地，并在平台支持时仅所有者可读。独立 Worker 在基本报告保存后追加有界管理历史，收集失败或尚未结束时仍可获取基本报告。近期操作提供上下文，不构成因果归因。
 
 ## Testing
 

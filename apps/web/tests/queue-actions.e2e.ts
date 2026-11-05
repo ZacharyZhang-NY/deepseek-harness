@@ -29,6 +29,7 @@ const UI_EXPECTED = join(SNAPSHOT_DIR, 'ui.expected.md')
 const SENDING_EXPECTED = join(SNAPSHOT_DIR, 'sending.expected.md')
 const WRITER_HELD_EXPECTED = join(SNAPSHOT_DIR, 'writer-held.expected.md')
 const FAILED_EXPECTED = join(SNAPSHOT_DIR, 'failed.expected.md')
+const GOAL_STOP_EXPECTED = join(SNAPSHOT_DIR, 'goal-stop.expected.md')
 const MODE = webSnapshotMode()
 
 const ACTIVE_PROMPT = 'Reply with a one-sentence description of event sourcing, then stop.'
@@ -123,21 +124,15 @@ describe('web e2e: queue row actions', () => {
       await input.fill(REMOVE)
       await input.press('Enter')
       await received.promise
-      const pending = page.locator('[data-queue-dock] [data-submission-echo]')
-      await pending.getByRole('status').waitFor()
-      expect(await pending.getByRole('status').textContent()).toBe('Sending…')
-      expect(await pending.getByRole('button').count()).toBe(3)
-      expect(await pending.getByRole('button').evaluateAll(buttons =>
-        buttons.every(button => (button as HTMLButtonElement).disabled))).toBe(true)
-      expect(await input.textContent()).toBe('')
-      expect(await input.getAttribute('contenteditable')).toBe('true')
+      // The composer keeps the message, read-only, until the Host accepts it; the queue shows nothing yet.
+      const sendingButton = page.getByRole('button', { name: 'Sending message', exact: true })
+      await sendingButton.waitFor()
+      expect(await sendingButton.getAttribute('aria-busy')).toBe('true')
+      expect(await input.textContent()).toBe(REMOVE)
+      expect(await input.getAttribute('contenteditable')).toBe('false')
+      expect(await page.locator('[data-queue-dock] [data-submission-echo]').count()).toBe(0)
       const sending = await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd)
       await compareOrRefreshGolden(SENDING_EXPECTED, sending, MODE)
-      await page.setViewportSize({ width: 390, height: 1000 })
-      await page.locator('[data-sidebar-collapsed="true"]').waitFor()
-      await expect.poll(() => pending.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true)
-      await page.setViewportSize({ width: 1680, height: 1000 })
-      await page.locator('[data-sidebar-collapsed="true"]').waitFor({ state: 'detached' })
     } finally {
       release.resolve(undefined)
     }
@@ -147,6 +142,8 @@ describe('web e2e: queue row actions', () => {
     expect(await page.locator('[data-queue-dock]').getByRole('status').count()).toBe(0)
     await input.fill(EDIT)
     await input.press('Enter')
+    // The Host queue row can arrive before the prompt reply that clears the composer.
+    await expect.poll(() => input.textContent(), { timeout: 10_000 }).toBe('')
     const queueHeader = page.getByRole('button', { name: '2 queued messages' })
     await expect.poll(() => queueHeader.getAttribute('aria-expanded'), { timeout: 10_000 })
       .toBe('false')
@@ -364,10 +361,11 @@ describe('web e2e: queue row actions', () => {
     await page.locator('[data-testid="todo-panel"]').waitFor({ timeout: 10_000 })
 
     for (const text of ['Layout queue first', 'Layout queue second']) {
-      // A just-submitted composer is read-only for the prompt round-trip.
       await page.locator('[data-composer-input][contenteditable="true"]').first().waitFor({ timeout: 10_000 })
       await input.fill(text)
       await input.press('Enter')
+      // The composer keeps a sent message, still editable, until the Host accepts it.
+      await expect.poll(() => input.textContent(), { timeout: 10_000 }).toBe('')
     }
     const queueHeader = page.getByRole('button', { name: '2 queued messages' })
     await expect.poll(() => queueHeader.getAttribute('aria-expanded'), { timeout: 10_000 })
@@ -421,6 +419,73 @@ describe('web e2e: queue row actions', () => {
     expect(tripwire.warnings).toEqual([])
   }, 120_000)
 
+  it.skipIf(MODE === 'record')('runs a prompt sent after Stop when a Goal round was queued behind stopped work', async () => {
+    overrideDir = await mkdtemp(join(tmpdir(), 'dsh-web-goal-stop-'))
+    const roundReady = join(overrideDir, '.round-ready')
+    const humanReady = join(overrideDir, '.human-ready')
+    const overridePath = join(overrideDir, 'replay.override.json')
+    const recorded = deriveReplayScript(parseSessionLog(await readFile(FIXTURE, 'utf8')))
+    await writeFile(overridePath, JSON.stringify([
+      { kind: 'hang', readyFile: roundReady },
+      { kind: 'hang', readyFile: humanReady },
+      recorded[0]!,
+    ] satisfies ReplayEntry[]))
+
+    const sessionEvents: SessionEvent[] = []
+    scaffold = await launchWebScaffold({ replayFixture: FIXTURE, replayOverride: overridePath, compareReplaySession: false })
+    scaffold.ctx.on('session/event', (_session, event: SessionEvent) => { sessionEvents.push(event) })
+    browser = await chromium.launch()
+    page = await newEnglishPage(browser)
+    const tripwire = watchConsole(page)
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    await connectFreshWorkspace(page, scaffold.workspaceCwd)
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-goal-stop'))
+
+    const input = page.locator('[data-composer-input]').first()
+    const editable = page.locator('[data-composer-input][contenteditable="true"]').first()
+    const stop = page.getByRole('button', { name: 'Stop generating', exact: true })
+    await editable.waitFor({ timeout: 10_000 })
+    await input.fill('/goal Keep working after Stop')
+    await input.press('Enter')
+    await expect.poll(() => existsSync(roundReady), { timeout: 15_000 }).toBe(true)
+
+    // Human work queued behind the running round survives the first Stop.
+    await editable.waitFor({ timeout: 10_000 })
+    await input.fill(REMOVE)
+    await input.press('Enter')
+    await page.getByRole('button', { name: 'Remove queued message', disabled: false }).waitFor({ timeout: 10_000 })
+    await stop.click()
+    await page.getByRole('button', { name: 'Resume goal' }).waitFor({ timeout: 10_000 })
+
+    // Resuming queues the next round behind that human prompt, which runs first.
+    await page.getByRole('button', { name: 'Resume goal' }).click()
+    await expect.poll(() => existsSync(humanReady), { timeout: 15_000 }).toBe(true)
+    await expect.poll(() => page.locator('[data-queue-dock] li', { hasText: '<goal_round>' }).count(), { timeout: 10_000 })
+      .toBe(1)
+    await stop.click()
+    await expect.poll(() => stop.count(), { timeout: 10_000 }).toBe(0)
+    await expect.poll(() => page.locator('[data-queue-dock]').count(), { timeout: 10_000 }).toBe(0)
+
+    const settled = scaffold.whenTurnSettled()
+    await editable.waitFor({ timeout: 10_000 })
+    await input.fill(WAKE)
+    await input.press('Enter')
+    await settled
+    await expect.poll(() => turnEndReasons(sessionEvents), { timeout: 15_000 })
+      .toEqual(['aborted', 'aborted', 'completed'])
+    expect(sessionEvents.flatMap(event => event.type === 'user/message' && event.data.source.kind === 'user'
+      ? event.data.content.flatMap(block => block.type === 'text' ? [block.text] : [])
+      : [])).toEqual([REMOVE, WAKE])
+    expect(sessionEvents.some(event => event.type === 'agent/inbox/spliced' && event.data.target === 'next-turn'
+      && event.data.outcome === 'canceled')).toBe(true)
+    await expect.poll(() => stop.count(), { timeout: 10_000 }).toBe(0)
+    const snapshot = await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd)
+    await compareOrRefreshGolden(GOAL_STOP_EXPECTED, snapshot, MODE)
+    expect(tripwire.pageErrors).toEqual([])
+    expect(tripwire.warnings).toEqual([])
+  }, 120_000)
+
   it.skipIf(MODE === 'record')('keeps its snapshot inventory closed', async () => {
     await assertFixtureInventory(
       SNAPSHOT_DIR,
@@ -428,6 +493,7 @@ describe('web e2e: queue row actions', () => {
         'collapsed.expected.md', 'editing.expected.md', 'layout.expected.md',
         'preserved.expected.md', 'preserved-expanded.expected.md', 'ui.expected.md',
         'sending.expected.md', 'failed.expected.md', 'writer-held.expected.md',
+        'goal-stop.expected.md',
       ],
     )
   })

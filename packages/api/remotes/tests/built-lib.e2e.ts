@@ -24,6 +24,7 @@ const requiredArtifacts = [
   'packages/goal/goal/lib/typert.host.js',
   'packages/api/gateway/lib/client.js',
   'packages/api/gateway/lib/index.js',
+  'packages/api/remote-access/lib/index.js',
   'packages/typert/registry/lib/client.js',
   'packages/typert/registry/lib/index.js',
   'packages/session/session-projection/lib/index.js',
@@ -39,6 +40,7 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
       connectionHost: 'packages/client/connection/lib/index.js',
       goal: 'packages/goal/goal/lib/index.js',
       goalTypert: 'packages/goal/goal/lib/typert.host.js',
+      remoteAccess: 'packages/api/remote-access/lib/index.js',
       registryClient: 'packages/typert/registry/lib/client.js',
       registryHost: 'packages/typert/registry/lib/index.js',
       remotesClient: 'packages/api/remotes/lib/client.js',
@@ -55,6 +57,7 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
       const { default: AgentRegistry } = await import(urls.agent)
       const connectionHost = await import(urls.connectionHost)
       const { default: TypertRemoteService } = await import(urls.apiGatewayHost)
+      const { default: RemoteAccessService } = await import(urls.remoteAccess)
       const { default: GoalService } = await import(urls.goal)
       const { default: SessionProjectionRegistry } = await import(urls.sessionProjections)
       const { TYPERT } = await import(urls.goalTypert)
@@ -83,9 +86,10 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
       })
       await host.plugin({ inject: connectionHost.inject, apply: connectionHost.apply })
       await host.plugin(TypertRegistry)
-      await host.plugin(AgentRegistry)
-      await host.plugin(TypertRemoteService)
       await host.plugin(SessionProjectionRegistry)
+      await host.plugin(AgentRegistry)
+      await host.plugin(RemoteAccessService)
+      await host.plugin(TypertRemoteService)
       await host.plugin(GoalService)
       host.typert.register(TYPERT)
 
@@ -113,9 +117,11 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
       host.agents.register(rootAgent)
       host.agents.register(scopedAgent)
 
-      if (routes.length !== 1 || routes[0].path !== '/api') {
+      const apiRoutes = routes.filter(route => route.path === '/api')
+      if (apiRoutes.length !== 1) {
         throw new Error('Connection did not register exactly one /api route')
       }
+      const apiRoute = apiRoutes[0]
       const server = createServer((request, response) => {
         if ((request.url ?? '/').startsWith('/?')) {
           if (host.connection.authorizeIndex(request, response)) {
@@ -124,7 +130,7 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
           }
           return
         }
-        void routes[0].handler(request, response)
+        void apiRoute.handler(request, response)
       })
       await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
       const address = server.address()
@@ -178,7 +184,7 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
           await client.plugin({ inject: plugin.inject, apply: plugin.apply })
         }
         client.typert.contexts.registerClient('agent', {
-          identity: candidate => candidate.builtAgentId,
+          identity: candidate => 'builtAgentId' in candidate ? candidate.builtAgentId : undefined,
         })
 
         const invalidResult = await client.remote.goals.create(rootAgent.id, { objective: 1 })

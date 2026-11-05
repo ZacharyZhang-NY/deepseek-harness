@@ -3,7 +3,10 @@
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "lib/types",
-    "types": ["client-build-environment", "node"]
+    "types": [
+      "client-build-environment",
+      "node"
+    ]
   },
   "include": [
     "src"
@@ -26,6 +29,9 @@
     },
     {
       "path": "../../api/workspace-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../api/remote-access/tsconfig.client.json"
     },
     {
       "path": "../../attachment/attachment"
@@ -58,6 +64,9 @@
       "path": "../../client/ui-renderer"
     },
     {
+      "path": "../../client/ui-workspace"
+    },
+    {
       "path": "../../client/ui-session"
     },
     {
@@ -80,6 +89,9 @@
     },
     {
       "path": "../../client/hmr"
+    },
+    {
+      "path": "../../client/ui-context-menu"
     }
   ]
 }

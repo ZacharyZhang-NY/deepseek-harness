@@ -4,8 +4,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
-import type { RemoteEventHostInfo } from './stream-protocol.ts'
+import type { PeerScope, RemoteUplinkWindow, TypertResourceReader } from '@deepseek-ai/dsh-typert-protocol'
+import type { RemoteEventAgentId, RemoteEventHostInfo } from './stream-protocol.ts'
 
 /** One Remote method request after a carrier has decoded its envelope. */
 export interface InvokeRemoteRequest {
@@ -20,8 +20,10 @@ export interface InvokeRemoteRequest {
    * `invocation.uplink()`; absent means an immediately ended iterable.
    */
   readonly uplink?: AsyncIterable<unknown>
-  /** Peer the call speaks for; absent means an in-process carrier, answered as the operator. */
-  readonly peer?: PeerScope
+  /** Carrier-provided frame capacity; absent for carriers without an encoded-frame inbox limit. */
+  readonly uplinkWindow?: RemoteUplinkWindow | undefined
+  /** Peer the call speaks for; every carrier and in-process caller names it explicitly. */
+  readonly peer: PeerScope
   /** Carrier or direct-caller cancellation injected only into cancellation-aware methods. */
   readonly signal?: AbortSignal
 }
@@ -32,6 +34,12 @@ export interface TypertRemoteEventFrame {
   readonly event: string
   /** Original event argument list after the owner validates it for JSON transport. */
   readonly args: readonly unknown[]
+  /**
+   * Readers of the resources the arguments carry, keyed by resource kind and
+   * called with the arguments as positional parameters. Absent or empty for
+   * a notification that touches the global resource.
+   */
+  readonly resources?: Readonly<Record<string, TypertResourceReader>>
 }
 
 /** Live Host values used to project one scoped Remote Event. */
@@ -88,7 +96,7 @@ export interface TypertGatewayWireStream {
    * @param payload - decoded carrier payload.
    * @param uplink - Client-to-Host items of the logical stream; a Gateway-owned endpoint returns its iterator
    * as soon as it opens, so the carrier drops those items instead of buffering them.
-   * @param peer - Peer the stream speaks for; `undefined` means the operator's in-process carrier.
+   * @param peer - Peer the stream speaks for; required, never defaulted.
    * @param signal - logical-stream cancellation.
    * @returns validated stream values.
    */
@@ -96,7 +104,7 @@ export interface TypertGatewayWireStream {
     endpoint: string,
     payload: unknown,
     uplink: AsyncIterable<unknown>,
-    peer: PeerScope | undefined,
+    peer: PeerScope,
     signal: AbortSignal,
   ) => Promise<AsyncIterable<unknown>>
 
@@ -122,11 +130,13 @@ export type TypertGatewayErrorCode =
   | 'gateway/context-unavailable'
   | 'gateway/definition-unavailable'
   | 'gateway/input-invalid'
+  | 'gateway/interactions-forbidden'
   | 'gateway/invocation-unavailable'
   | 'gateway/lookup-failed'
   | 'gateway/lookup-not-found'
   | 'gateway/lookup-unavailable'
   | 'gateway/method-unavailable'
+  | 'gateway/peer-disposed'
   | 'gateway/protocol'
   | 'gateway/provider-mismatch'
   | 'gateway/result-invalid'
@@ -134,16 +144,25 @@ export type TypertGatewayErrorCode =
   | 'gateway/signature-invalid'
   | 'gateway/uplink-overflow'
 
+/** Public metadata of one unsettled forwarded Remote event. */
+export interface PendingRemoteEventInfo {
+  readonly event: string
+  readonly agentId: RemoteEventAgentId
+}
+
 /** Host dispatcher consumed by Connection adapters. */
 export interface TypertGateway {
   /** Carrier adapter shared by WebSocket and in-process transports. */
   readonly wireStream: TypertGatewayWireStream
 
   /**
-   * Check for an active Client event stream.
-   * @returns whether a stream is open and has not been cancelled.
+   * Check for an active owner Client event stream, the only kind that can answer forwarded waterfalls.
+   * @returns whether an owner stream is open and has not been cancelled.
    */
   hasLiveClient(): boolean
+
+  /** @returns detached metadata for all unsettled forwarded events in arrival order. */
+  getPendingRemoteEvents(): readonly PendingRemoteEventInfo[]
 
   /**
    * Register the application-selected forwarded-event source.

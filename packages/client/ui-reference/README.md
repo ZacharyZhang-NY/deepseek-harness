@@ -39,6 +39,8 @@ One unavailable or failed candidate domain yields no rows for that domain while 
 
 Click a file reference in the composer to preview its current contents in the right Sidebar. Quoted paths retain their spaces, and paths resolve in the composer Session. Folder and Session references retain their editing behavior.
 
+Interactive file chips obtain `useContextMenu` from their Session Slot and receive path resolution through the file-reference registration. Paths resolve against the live workspace root when the gesture begins; the Session’s working directory does not change reference meaning. Display-only chips install no context-menu handlers, and no Markdown provider is needed.
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -58,6 +60,8 @@ Candidate requests require an existing retained Client Session and share one tem
 ### Serialization
 
 File picks preserve the natural text defined by the shared `@path` grammar as the hidden serialized and clipboard form. Session picks use the canonical `@[label](dsh-session:…)` mention; serialization never reconstructs identity from the visible title.
+
+The plugin also registers file and folder matchers with [UserText](../ui-conversation/README.md#sent-user-text) and owns their `conversation.user.text.node` renderers. Each query returns the next complete reference at an original-text offset without file discovery; the shared evaluator resolves overlaps by source position. Interactive file nodes receive a Session-bound `openFile` injection; navigation failures keep the reference visible and offer a local retry/close dialog. Folder nodes remain labels.
 
 </details>
 
@@ -104,5 +108,3 @@ These limits define when the reference source cannot help; they are current pack
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. A single slash-source registration whose disposal is proven by the HMR-safety spec — it emits no cordis events and owns no cross-plugin mutable state.

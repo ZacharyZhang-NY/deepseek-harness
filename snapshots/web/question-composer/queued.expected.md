@@ -5,11 +5,13 @@
   - tablist:
     - tab "Chat" [selected]
     - tab "Trajectory"
+  - button "More conversation views"
 - text: "Use the ask_user_question tool to ask me exactly one multi-select question with id \"color\", question \"Which color do you prefer?\", header \"Pick one\", and two options: label \"Blue\" with description \"A cool recessive hue that reads as calm and trustworthy in long reading sessions and dense dashboards.\", and label \"Green\" with description \"A restful mid-spectrum hue with the highest perceived brightness, easiest on the eye over long sessions.\" Set multi_select to true. After I answer, reply with the single word DONE and stop. {{clock}}"
 - button "Copy"
 - status: Completed
 - button "Completed in {{duration}}" [expanded]
 - button "Asked questions" [expanded]
+- button "Context injection runtime-context"
 - button "Think The user wants me to use the ask_user_question tool with specific parameters. Let me do exactly that."
 - button "Ask question" [expanded]
 - text: Ask question 1/1 answered
@@ -19,7 +21,7 @@
 - button "Inspect"
 - list:
   - listitem:
-    - text: "{\"kind\":\"answer_to_pending_question\",\"tool\":\"ask_user_question\",\"callId\":\"call_00_Cijldc88LYmVPCXYUsRq1617\",\"questions\":[{\"id\":\"color\",\"question\":\"Which color do you prefer?\",\"header\":\"Pick one\",\"mult…"
+    - text: "{\"kind\":\"answer_to_pending_question\",\"tool\":\"ask_user_question\",\"callId\":\"call_00_Cijldc88LYmVPCXYUsRq1617\",\"questions\":[{\"id\":\"color\",\"question\":\"Which color do you prefer?\",\"header\":\"Pick one\",\"multi_select\":true,\"options\":[{\"label\":\"Blue\",\"description\":\"A cool recessive hue that reads as calm and trustworthy in long reading sessions and dense dashboards.\"},{\"label\":\"Green\",\"description\":\"A restful mid-spectrum hue with the highest perceived brightness, easiest on the eye over long sessions.\"}]}],\"answers\":[{\"id\":\"color\",\"selected\":[\"Green\"],\"custom\":\"Answered after the timeout\"}]}"
     - button "Edit queued message"
     - button "Remove queued message"
     - button "Steer queued message" [disabled]

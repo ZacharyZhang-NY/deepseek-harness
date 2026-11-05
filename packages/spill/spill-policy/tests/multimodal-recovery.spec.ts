@@ -1,8 +1,12 @@
 /** Real attachments, filesystem recovery, Node PTC, and DeepSeek image request bytes without a desktop or API key. */
+import { executeModelToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as PtcToolExecutor from '@deepseek-ai/dsh-tool-executor-ptc'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
+import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import LocalAttachments from '@deepseek-ai/dsh-attachment-local'
@@ -41,14 +45,16 @@ const text = (value: string): ContentBlock => ({ type: 'text', text: value })
 const textOf = (content: readonly ContentBlock[]): string => content.filter(block => block.type === 'text').map(block => block.text).join('')
 const imagesOf = (content: readonly ContentBlock[]): ImageBlock[] => content.filter((block): block is ImageBlock => block.type === 'image')
 
-async function setup() {
+async function setup(mode: 'native' | 'ptc' = 'native') {
   const root = await mkdtemp(join(tmpdir(), 'dsh-image-recovery-'))
   const ctx = new Context()
+  provideWorkingDirectoryFixture(ctx, root)
   onTestFinished(async () => {
     try { await ctx.fiber.dispose() } finally { await rm(root, { recursive: true, force: true }) }
   })
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime, { mode: 'both' })
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(mode === 'ptc' ? PtcToolExecutor : NativeToolExecutor)
   await ctx.plugin(FileSystem, { cwd: root })
   await ctx.plugin(LocalAttachments, { dshHome: join(root, 'home') })
   await ctx.plugin(ToolFs)
@@ -72,7 +78,7 @@ async function setup() {
   const session = ctx.sessions.create(SessionId('recovery'), { meta: { cwd: root } })
   const agent = { session, options: { provider: 'vision', model: MODEL }, ctx } as Agent
   let ordinal = 0
-  const execute = (name: string, args: JsonValue = {}) => ctx.tools.execute({
+  const execute = (name: string, args: JsonValue = {}) => executeModelToolFixture(ctx, {
     name, arguments: args, callId: ToolCallId(`recovery-${++ordinal}`), agent, signal: new AbortController().signal,
   })
   const red = await sharp({ create: { width: 1920, height: 1080, channels: 3, background: '#ff0000' } }).png().toBuffer()
@@ -175,7 +181,7 @@ describe('multimodal recovery through real providers', () => {
   })
 
   it.each(['sequential', 'parallel'] as const)('keeps budgets and image identities separate across %s Node PTC calls', async (mode) => {
-    const { ctx, session, execute, cost, requestImages, gates } = await setup()
+    const { ctx, session, execute, cost, requestImages, gates } = await setup('ptc')
     await ctx.plugin(Subprocess)
     await ctx.plugin(Sandbox, {})
     await ctx.plugin(SandboxPolicy, { mode: 'danger-full-access' })

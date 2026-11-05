@@ -2,8 +2,10 @@
 import type { FiberState } from '@deepseek-ai/cordis'
 import type { Entry, Loader } from '@deepseek-ai/cordis-plugin-loader'
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
-import { parseBootManifest } from './manifest.ts'
+import { parseBootManifest, readRelease } from './manifest.ts'
 import type { BootManifest, ClientModuleLoader } from './manifest.ts'
+import { ReleaseChangeGate, type ClientReleaseChange } from './release-change.ts'
+import { notifySubscribers } from './notify.ts'
 import { removeOwnedStyles, tearDownEntryFiber } from './entry-lifecycle.ts'
 
 /** Page-local failures do not change the Host's bundle enablement. */
@@ -43,6 +45,8 @@ export class ClientEntries {
   // The modules bootstrap factory cannot request platform libraries before the shell supplies its seed.
   private snapshot: ClientEntryState = { syncing: false, failures: [] }
   private readonly listeners = new Set<() => void>()
+  /** Admits only Host graphs of the page's boot release. */
+  private readonly release: ReleaseChangeGate
   private readonly managed = new Map<string, Entry>()
   private readonly revisions = new Map<string, string>()
   private loader: Loader | undefined
@@ -58,10 +62,23 @@ export class ClientEntries {
    */
   constructor(private readonly modules: ClientModuleLoader, private readonly index: ModuleIndex) {
     this.desired = modules.manifest
+    this.release = new ReleaseChangeGate(modules.manifest.release)
+  }
+
+  /** Host release change to announce; undefined while the Host serves the page's boot release or a dismissed one. */
+  get releaseChange(): ObservableSnapshot<ClientReleaseChange | undefined> {
+    return this.release.change
+  }
+
+  /** Stop announcing the connected Host's release; updates stay paused until the Host returns to the boot release or the page reloads. */
+  dismissRelease(): void {
+    this.release.dismiss()
   }
 
   /**
    * Create the initial roster and retain its entry identities for subsequent reconciliation.
+   * As the Host Loader group does, a row whose creation rejects (for example a module that exports no
+   * plugin) is logged and stays an inactive entry, so one row cannot abort startup before the boot audit.
    * @param loader - Page Loader, already configured with the module system.
    * @param manifest - Initial roster audited by the boot caller.
    * @returns after initial entries and their activation settle; boot owns its activation audit.
@@ -77,7 +94,7 @@ export class ClientEntries {
     }, 'client-modules: entry reconciliation')
     return this.enqueue(async () => {
       await Promise.all(this.desired.plugins.map(async ({ id }) => {
-        await this.create(loader, id)
+        await this.create(loader, id).catch((error: unknown) => { loader.ctx.logger.error(error) })
       }))
       await loader.await()
       for (const row of this.modules.manifest.modules) this.revisions.set(row.id, row.rev)
@@ -86,10 +103,13 @@ export class ClientEntries {
 
   /**
    * Validate and apply the latest full Host graph. Changed targets cancel obsolete mounts; identical targets share pending loads.
+   * The release is compared before the rest of the graph is validated: a graph of another release, including one whose
+   * format this page cannot read, is not applied and {@link releaseChange} announces it.
    * @param graph - JSON-decoded graph received from the Host.
-   * @returns after the queued reconciliation; per-package failures remain available in {@link state}.
+   * @returns after the queued reconciliation, or at once for another release; per-package failures remain available in {@link state}.
    */
   sync(graph: unknown): Promise<void> {
+    if (!this.release.observe(readRelease(graph))) return Promise.resolve()
     const manifest = parseBootManifest(graph)
     if (entryTargets(manifest) !== entryTargets(this.desired)) this.generation++
     this.desired = manifest
@@ -109,11 +129,13 @@ export class ClientEntries {
   /**
    * Replace one entry's code in the same queue as graph updates; duplicate revisions are ignored.
    * Entries missing after a failed import are reconciled; bootstrap replacement fails before teardown.
+   * Ignored while the connected Host serves another release than the page's boot release.
    * @param id - Package id from a rebuilt frame.
    * @param rev - Opaque revision selecting the rebuilt artifact.
    * @returns after queued work; replacement errors reject, while per-package reconciliation errors remain in {@link state}.
    */
   reload(id: string, rev: string): Promise<void> {
+    if (!this.release.matches) return Promise.resolve()
     this.desired = {
       ...this.desired,
       modules: this.desired.modules.map(row => row.id === id ? { ...row, rev } : row),
@@ -137,14 +159,7 @@ export class ClientEntries {
 
   private publish(snapshot: ClientEntryState): void {
     this.snapshot = snapshot
-    for (const listener of [...this.listeners]) {
-      try {
-        listener()
-      } catch (error) {
-        // The page controller has no owning plugin Context for a scoped logger.
-        console.error('client-modules: synchronization subscriber failed', error)
-      }
-    }
+    notifySubscribers(this.listeners, 'synchronization')
   }
 
   private enqueue(task: () => Promise<void>, subject = 'graph'): Promise<void> {
@@ -223,7 +238,8 @@ export class ClientEntries {
         } else if (entry.fiber === undefined) {
           await this.replace(entry, row.id, row.rev, generation)
         } else if (entry.fiber.state === FAILED) {
-          entry.fiber.update(entry.options.config)
+          // A retry with unchanged config is not a configuration change to persist.
+          await entry.fiber.update(entry.options.config, true)
         }
       } catch (error) {
         failures.push({ id: row.id, message: String(error) })

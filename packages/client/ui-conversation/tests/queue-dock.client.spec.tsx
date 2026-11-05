@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * QueueDock rendering and operations: authoritative rows, inline editing,
  * collapse state, removal, QueueDock Steer, failure notices, and live retirement.
@@ -17,13 +18,15 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
-  bindSnapshotSelector, conversationSnapshot, makeTranslate,
+  allowAllAccess, bindSnapshotSelector, conversationSnapshot, makeTranslate,
 } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session/client'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type { InputState } from '../src/client/contract/input.ts'
 import { zh } from '../src/client/locales.ts'
 import { QueueDock, queueDockEntry, type QueueDockInjected, type QueueDockProps } from '../src/client/queue/QueueDock.tsx'
+import type { UserTextInput } from '../src/client/index.ts'
+import { createUserTextFixture } from './user-text-component-fixture.client.tsx'
 
 // Every session-scope fixture carries the resource hook the resources plugin merges into GlobalStandardProps.
 const useResource = (() => ({ status: 'none' as const, value: undefined, failure: undefined })) as GlobalStandardProps['useResource']
@@ -98,8 +101,14 @@ const t: QueueDockProps['t'] = makeTranslate(zh, commonZh)
 const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({ activePanelId: null })
 
 function kitFor(snapshot: SessionSnapshot, injected: Partial<QueueDockInjected> = {}) {
+  const renderText = createUserTextFixture()
+  const renderFactorySlot: QueueDockProps['renderFactorySlot'] = (name, owner) => {
+    if (name !== 'conversation.user.text') throw new Error(`Unexpected queue Factory: ${name}`)
+    return renderText(owner as UserTextInput)
+  }
   return {
     sessionId: SID,
+    renderFactorySlot,
     t,
     usePanelInfo,
     useSessions: (() => { throw new Error('unused') }) as SnapshotSelectorHook<SessionListState>,
@@ -109,6 +118,8 @@ function kitFor(snapshot: SessionSnapshot, injected: Partial<QueueDockInjected> 
       createSnapshotStore<SessionStatusSnapshot>(new Map()),
     ),
     useWorkspaces: (() => { throw new Error('unused') }) as never,
+    ...allowAllAccess,
+    useContextMenu: contextMenuHook(),
     useProjection: (() => undefined) as never,
     useConversation: bindSnapshotSelector(createSnapshotStore(conversationSnapshot())),
     useChat: (() => { throw new Error('unused') }) as QueueDockProps['useChat'],
@@ -139,6 +150,21 @@ function imageRow(id: string, refId: string, text = ''): UserMessage {
 }
 
 describe('QueueDock', () => {
+  it('keeps the same quote preview when a queued echo hands off to Host content', () => {
+    const requestId = 'quote-handoff' as SessionSnapshot['pendingSubmissions'][number]['requestId']
+    const content = [{ type: 'text' as const, text: '> @literal /review' }]
+    const initial = { ...snapshotWith([]), pendingSubmissions: [{ requestId, placement: 'queued' as const,
+      time: 1000, text: content[0]!.text, attachments: [] }] }
+    const source = liveSession(initial)
+    const view = render(<QueueDock {...kitFor(initial)} useSession={source.useSession} useProjection={source.useProjection} />)
+    expect(view.container.querySelector('[data-quote-preview-text]')?.textContent).toBe('@literal /review')
+    const queued: UserMessage = { ...row('accepted-quote', ''), content, source: { kind: 'user', rpcId: requestId } }
+    act(() => { source.push(snapshotWith([queued])) })
+    expect(view.container.querySelectorAll('[data-quote-preview]')).toHaveLength(1)
+    expect(view.container.querySelector('[data-quote-preview-text]')?.textContent).toBe('@literal /review')
+    expect(view.container.querySelector('[data-ref-chip]')).toBeNull()
+  })
+
   it.each(['ABC', 'ACB', 'BAC', 'BCA', 'CAB', 'CBA'])(
     'keeps repeated queued submissions in Dock through acceptance and FIFO claims (%s)', (hostOrder) => {
       const pending: SessionSnapshot['pendingSubmissions'] = ['A', 'B', 'C'].map(id => ({
@@ -375,7 +401,7 @@ describe('QueueDock', () => {
       const single = snapshotWith([row('i-tip', 'queued draft')])
       const source = liveSession(single)
       const view = render(<QueueDock {...kitFor(single)} useSession={source.useSession} useProjection={source.useProjection} />)
-      fireEvent.mouseEnter(view.getByLabelText('删除排队消息'))
+      fireEvent.pointerEnter(view.getByLabelText('删除排队消息'))
       act(() => { vi.advanceTimersByTime(500) })
       const tooltip = view.getByRole('tooltip')
       expect(tooltip.textContent).toBe('删除排队消息')
@@ -434,12 +460,17 @@ describe('QueueDock', () => {
     expect(view.queryByText('three')).toBeNull()
   })
 
-  it('flattens and caps previews at 200 code points while preserving complete editable text', () => {
-    const text = `  before   ${'🙂'.repeat(201)}  after`
+  it('displays complete previews with compressed whitespace and CSS ellipsis while preserving editable text', () => {
+    const text = `  before \n  ${'🙂'.repeat(201)}  after`
     const snap = snapshotWith([row('long-preview', text)])
     const source = liveSession(snap)
-    const view = render(<QueueDock {...kitFor(snap)} useSession={source.useSession} useProjection={source.useProjection} />)
-    expect(view.getByText(`before ${'🙂'.repeat(193)}…`)).toBeTruthy()
+    const props = kitFor(snap)
+    const renderFactory = vi.spyOn(props, 'renderFactorySlot')
+    const view = render(<QueueDock {...props} useSession={source.useSession} useProjection={source.useProjection} />)
+    expect(renderFactory).toHaveBeenCalledWith('conversation.user.text', {
+      text, facts: { collapseWhitespace: true, trimWhitespace: true }, interactive: false, ellipsis: true,
+    })
+    expect(view.getByRole('listitem').textContent).toBe(`before ${'🙂'.repeat(201)} after`)
     fireEvent.click(view.getByLabelText('编辑排队消息'))
     expect((view.getByRole('textbox') as HTMLTextAreaElement).value).toBe(text)
   })
@@ -673,7 +704,6 @@ describe('QueueDock', () => {
           childSessionId: SID,
           mode: 'continuable' as const,
         },
-        parentAvailable: false,
       },
     }
     const source = liveSession(snap)
@@ -696,7 +726,6 @@ describe('QueueDock', () => {
           childSessionId: SID,
           mode: 'one-shot' as const,
         },
-        parentAvailable: true,
       },
     }
     const source = liveSession(snap)

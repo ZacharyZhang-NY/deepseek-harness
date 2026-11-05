@@ -1,11 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { createUserMessage, ToolCallId, LlmError, ReasoningEffortId, StreamChunk, expandAssistantStream } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import AgentRegistry, { type Agent, type AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -35,6 +37,7 @@ async function harness(adapter: MockAdapter, persona = '') {
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt, { personaPrefix: persona })
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -545,9 +548,9 @@ describe('agent loop', () => {
     expect(request!.tools?.map(t => t.name)).toEqual(['noop'])
   })
 
-  it('resolves {{cwd}} from the agent session workspace (factory create with meta.cwd)', async () => {
+  it('keeps the Session directory out of system-prompt variables', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter, 'Working in {{cwd}}.')
+    const ctx = await harness(adapter, 'A coding agent.')
     const handle = await ctx.agents.create({
       sessionId: SessionId('s-cwd'),
       meta: { cwd: '/work/space' },
@@ -558,13 +561,15 @@ describe('agent loop', () => {
     send(agent, 'hi')
     await waitForIdle(ctx, agent)
 
-    expect(systemOf(adapter.requests[0])).toBe('You are an AI agent powered by DeepSeek Harness.\n\nWorking in /work/space.')
+    expect(systemOf(adapter.requests[0])).toBe('You are an AI agent powered by DeepSeek Harness.\n\nA coding agent.')
+    expect((await ctx.systemPrompt.assemble({ agent, scope: agent })).variables).not.toHaveProperty('cwd')
   })
 
   it('contains a strict-variable render failure: the turn errors, the loop keeps serving turns', async () => {
-    // A missing cwd variable must fail one turn without preventing a later valid turn.
+    // A missing custom_directory variable must fail one turn without preventing a later valid turn.
     const adapter = new MockAdapter([textResponse('ok after rescue')])
-    const ctx = await harness(adapter, 'In {{cwd}}.')
+    const ctx = await harness(adapter, 'In {{custom_directory}}.')
+    ctx.systemPrompt.variable('custom_directory', () => undefined)
     const errors: Error[] = []
     ctx.on('agent/error', ({ error }) => {
       if (error instanceof Error) errors.push(error)
@@ -576,7 +581,7 @@ describe('agent loop', () => {
 
     expect(adapter.requests).toHaveLength(0) // the request was never sent
     expect(errors.map(error => error.message)).toEqual([
-      'prompt variable "{{cwd}}" has no value for this assembly (section "deployment:persona-prefix")',
+      'prompt variable "{{custom_directory}}" has no value for this assembly (section "deployment:persona-prefix")',
     ])
     const turnEnd = agent.session.snapshotEvents().find(e => e.type === 'turn/end')
     expect(turnEnd?.type === 'turn/end' && turnEnd.data.reason.kind).toBe('error')
@@ -584,10 +589,10 @@ describe('agent loop', () => {
       ? turnEnd.data.reason.error.message
       : '').toContain('no value for this assembly')
 
-    // The loop survived: a waterfall listener rescues {{cwd}} and the SAME
+    // The loop survived: a waterfall listener rescues {{custom_directory}} and the SAME
     // agent completes a real model turn.
     ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
-      assembly.variables['cwd'] = '/rescued'
+      assembly.variables['custom_directory'] = '/rescued'
       return next()
     })
     send(agent, 'again')
@@ -600,24 +605,11 @@ describe('agent loop', () => {
     expect(turnEnds[1]?.type === 'turn/end' && turnEnds[1].data.reason.kind).toBe('completed')
   })
 
-  it('supports the model-via-agent/request path with a {{model}} persona: the supplier states it via the assemble waterfall', async () => {
-    // AgentOptions.model unset: the model arrives in the agent/request
-    // waterfall (the loop's documented fallback — see runStep's no-model
-    // error). {{model}} renders BEFORE that waterfall, so the SAME plugin
-    // states the fact early on system-prompt/assemble — the owner of a
-    // late-bound fact owns stating it wherever it is claimed.
+  it('uses a recorded selection for both the request and the {{model}} persona', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter, 'You run on {{model}}.')
-    ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
-      assembly.variables['provider'] = 'mock'
-      assembly.variables['model'] = 'mock'
-      return next()
-    })
-    ctx.on('agent/request', async (_payload, next) => {
-      const config = await next()
-      return { ...config, provider: 'mock', model: 'mock' }
-    })
-    const agent = await ctx.agentLoop.create(SessionId('a-late-model'), {})
+    const agent = await ctx.agentLoop.create(SessionId('a-recorded-model'), {})
+    agent.model.select({ provider: 'mock', model: 'mock' })
 
     send(agent, 'hi')
     await waitForIdle(ctx, agent)
@@ -768,6 +760,152 @@ describe('agent loop', () => {
     expect(runtimeContexts).toHaveLength(2)
     expect(adapter.requests[1]?.messages.some(message =>
       message.role === 'user' && message.source?.kind === 'runtime-context')).toBe(true)
+  })
+
+  it.each(['before', 'after'] as const)('reconciles runtime context replaced %s the pre-step fallback', async (timing) => {
+    const adapter = new MockAdapter([textResponse('one'), textResponse('two')])
+    const ctx = await harness(adapter)
+    try {
+      ctx.systemPrompt.context({ name: 'directory', order: 0, required: true, text: 'Current working directory: /workspace.' })
+      const agent = await ctx.agentLoop.create(SessionId(`runtime-context-pre-step-${timing}`), { provider: 'mock', model: 'mock' })
+      send(agent, 'first')
+      await agent.whenIdle()
+      const retained = agent.session.snapshotEvents().find(event => event.type === 'user/message' && event.data.source.kind === 'runtime-context')
+      if (retained === undefined) throw new Error('missing initial runtime context')
+      const replace = (): void => {
+        agent.session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'compacted summary' }], source: { kind: 'test-compaction' },
+        }), {
+          surfaceOp: { op: 'replace', startSeq: retained.seq, endSeq: retained.seq }, sourceEventSeqs: [retained.seq],
+        })
+      }
+      ctx.on('agent/pre-step', async (_payload, next) => {
+        if (timing === 'before') replace()
+        const decision = await next()
+        if (timing === 'after') replace()
+        return decision
+      })
+      send(agent, 'second')
+      await agent.whenIdle()
+      const snapshots = agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'runtime-context')
+      expect(snapshots).toHaveLength(2)
+      expect(adapter.requests[1]?.messages.some(message => message.role === 'user' && message.source?.kind === 'runtime-context'
+        && message.content.some(block => block.type === 'text' && block.text.includes('/workspace')))).toBe(true)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'user')).toHaveLength(2)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('replaces a stale owned snapshot at its accepted position and admits it once', async () => {
+    const adapter = new MockAdapter([textResponse('done')])
+    const ctx = await harness(adapter)
+    try {
+      let current = 'before'
+      ctx.systemPrompt.context({ name: 'fact', order: 0, text: () => current })
+      const agent = await ctx.agentLoop.create(SessionId('context-position'), { provider: 'mock', model: 'mock' })
+      ctx.on('agent/pre-step', async (_payload, next) => {
+        const decision = await next()
+        current = 'after'
+        if (decision.kind === 'reject') return decision
+        const context = decision.messages.find(message => message.source.kind === 'runtime-context')!
+        return { ...decision, messages: [context, ...decision.messages.filter(message => message !== context), context] }
+      })
+      send(agent, 'accepted user')
+      await agent.whenIdle()
+      const users = adapter.requests[0]?.messages.filter(message => message.role === 'user') ?? []
+      expect(users.map(message => message.source?.kind)).toEqual(['runtime-context', 'user'])
+      expect(users[0]?.content).toEqual([{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nafter' }])
+      expect(users[1]?.content).toEqual([{ type: 'text', text: 'accepted user' }])
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message')).toHaveLength(2)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('drops an uncommitted optional snapshot suppressed after the pre-step fallback', async () => {
+    const adapter = new MockAdapter([textResponse('done')])
+    const ctx = await harness(adapter)
+    try {
+      ctx.systemPrompt.context({ name: 'fact', order: 0, text: 'optional' })
+      const agent = await ctx.agentLoop.create(SessionId('context-suppressed-at-admission'), { provider: 'mock', model: 'mock' })
+      ctx.on('agent/pre-step', async (_payload, next) => {
+        const decision = await next()
+        ctx.systemPrompt.suppressRuntimeContext()
+        return decision
+      })
+      send(agent, 'accepted user')
+      await agent.whenIdle()
+      expect(adapter.requests[0]?.messages.filter(message => message.role === 'user').map(message => message.source?.kind)).toEqual(['user'])
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message')).toHaveLength(1)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('commits no pending user or prompt when a context provider cancels admission', async () => {
+    const adapter = new MockAdapter([])
+    const ctx = await harness(adapter)
+    try {
+      const agent = await ctx.agentLoop.create(SessionId('context-canceled-at-admission'), { provider: 'mock', model: 'mock' })
+      let evaluations = 0
+      ctx.systemPrompt.context({ name: 'cancel', order: 0, text: () => {
+        if (++evaluations === 2) agent.cancel({ kind: 'user' })
+        return 'pending'
+      } })
+      send(agent, 'do not commit')
+      await agent.whenIdle()
+      expect(evaluations).toBe(2)
+      expect(adapter.requests).toHaveLength(0)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message' || event.type === 'system/message')).toHaveLength(0)
+      expect(agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')?.data.reason.kind).toBe('aborted')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('restores runtime context during a retry without admitting the user batch twice', async () => {
+    const adapter = new MockAdapter([textResponse('one'), () => { throw new LlmError('overflow', 'CONTEXT_LENGTH') }, textResponse('two')])
+    const ctx = await harness(adapter)
+    try {
+      ctx.systemPrompt.context({ name: 'directory', order: 0, required: true, text: 'Current working directory: /workspace.' })
+      const agent = await ctx.agentLoop.create(SessionId('runtime-context-retry'), { provider: 'mock', model: 'mock' })
+      send(agent, 'first')
+      await agent.whenIdle()
+      ctx.on('agent/request-error', () => {
+        const retained = agent.session.snapshotEvents().findLast(event => event.type === 'user/message' && event.data.source.kind === 'runtime-context')
+        if (retained === undefined) throw new Error('missing retained context')
+        agent.session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'compacted checkpoint' }], source: { kind: 'test-compaction' },
+        }), { surfaceOp: { op: 'replace', startSeq: retained.seq, endSeq: retained.seq }, sourceEventSeqs: [retained.seq] })
+        return Promise.resolve({ kind: 'retry' as const })
+      })
+      send(agent, 'second')
+      await agent.whenIdle()
+      expect(adapter.requests).toHaveLength(3)
+      expect(adapter.requests[2]?.messages.some(message => message.role === 'user' && message.source?.kind === 'runtime-context')).toBe(true)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'runtime-context')).toHaveLength(2)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'user')).toHaveLength(2)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it.each(['reject', 'empty'] as const)('does not commit required runtime context after a pre-step %s decision', async (decision) => {
+    const adapter = new MockAdapter([])
+    const ctx = await harness(adapter)
+    try {
+      ctx.systemPrompt.context({ name: 'directory', order: 0, required: true, text: 'Current working directory: /workspace.' })
+      const agent = await ctx.agentLoop.create(SessionId(`runtime-context-${decision}`), { provider: 'mock', model: 'mock' })
+      ctx.on('agent/pre-step', async () => decision === 'reject' ? { kind: 'reject' as const } : { kind: 'enter' as const, messages: [] })
+      send(agent, 'do not admit')
+      await agent.whenIdle()
+      expect(adapter.requests).toHaveLength(0)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message')).toHaveLength(0)
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'step/start')).toHaveLength(0)
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 
   it('clears compacted runtime context after the active set becomes empty', async () => {
@@ -1161,27 +1299,27 @@ describe('agent loop', () => {
     expect(texts).toContain('late steering')
   })
 
-  it('agent/request waterfall switches models by returning a replacement config; the switch is logged', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
+  it.each(['provider', 'model'] as const)('rejects an agent/request replacement that changes %s after step preparation', async (field) => {
+    const adapter = new MockAdapter([textResponse('never')])
     const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
     ctx.on('agent/request', async (_payload, next) => {
       const config = await next()
-      // The seed is frozen — config is not a mutable per-call knob; a switch
-      // is proposed by returning a replacement, and the loop logs it.
       expect(Object.isFrozen(config)).toBe(true)
       expect(() => { (config as { model: string }).model = 'other-model' }).toThrow(TypeError)
-      return { ...config, model: 'other-model' }
+      return { ...config, [field]: 'other' }
     })
 
     send(agent, 'hi')
     await waitForIdle(ctx, agent)
-    expect(adapter.requests[0]!.model).toBe('other-model')
-    // The header event records what the request ACTUALLY used — the switch is
-    // a reconstructable fact, not silent drift.
-    const headerEvent = agent.session.snapshotEvents().find(e => e.type === 'request/header')
-    expect(headerEvent?.type === 'request/header' && headerEvent.data.header.config.model).toBe('other-model')
+    expect(adapter.requests).toEqual([])
+    expect(agent.session.snapshotEvents().filter(event => ['request/header', 'user/message', 'system/message'].includes(event.type)))
+      .toEqual([])
+    expect(agent.session.snapshotEvents().at(-1)).toMatchObject({
+      type: 'turn/end', data: { reason: { kind: 'error', error: {
+        message: `agent "a1": agent/request proposed "${field === 'provider' ? 'other/mock' : 'mock/other'}" after step preparation fixed "mock/mock"; use agent.model.select() before step preparation`,
+      } } },
+    })
   })
 
   it('agent/pre-step fires once per proposed step before the step is opened', async () => {
@@ -1764,17 +1902,20 @@ describe('agent loop', () => {
       defaultEffort: effort,
     })
     const ctx = new Context()
+    onTestFinished(async () => { await ctx.fiber.dispose() })
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, {
       agents: [{ id: SessionId('config-agent'), provider: 'mock', model: 'mock', reasoningEffort: effort }],
     })
     ctx.llm.registerAdapter(['mock'], adapter)
 
+    await vi.waitFor(() => { expect(ctx.agents.list()).toHaveLength(1) })
     const agent = ctx.agents.list()[0]!
     expect(agent).toBeDefined()
     expect(agent.id).toBe(agent.session.id)
@@ -1792,16 +1933,19 @@ describe('agent loop', () => {
 
   it('attaches config agent cwd to the fresh session header', async () => {
     const ctx = new Context()
+    onTestFinished(async () => { await ctx.fiber.dispose() })
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, {
       agents: [{ id: SessionId('config-agent'), provider: 'mock', model: 'mock', cwd: '/work/project' }],
     })
 
+    await vi.waitFor(() => { expect(ctx.agents.list()).toHaveLength(1) })
     const agent = ctx.agents.list()[0]!
     expect(agent.session.header.cwd).toBe('/work/project')
   })

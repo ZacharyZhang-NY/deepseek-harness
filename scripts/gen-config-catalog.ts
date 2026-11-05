@@ -293,7 +293,9 @@ function schemaAlias(world: World, ctx: FileCtx, name: string): { ctx: FileCtx; 
   if (imported === undefined || imported.typeOnly || imported.imported === '*' || imported.imported === 'default') {
     throw new Error(`schema alias '${name}' must name a const or named value import`)
   }
-  const target = loadWorkspaceSource(world, ctx, imported.specifier)
+  const target = imported.specifier.startsWith('.') && imported.specifier.endsWith('.ts')
+    ? loadRelative(world, ctx, imported.specifier)
+    : loadWorkspaceSource(world, ctx, imported.specifier)
   const expr = schemaConst(target, imported.imported, true)
   if (expr === null) throw new Error(`schema import '${imported.specifier}' has no exported const '${imported.imported}'`)
   return { ctx: target, expr }
@@ -502,7 +504,7 @@ function unwrapExpr(expr: ts.Expression): ts.Expression {
  * packages whose schemas an intersect composes. A key path is the top-level
  * key or a nested path through object/array compositions (`agents[].id`).
  * Handles object/union calls, chained refinements, named const schema imports
- * through public workspace source paths, and `z.intersect([X.Config, …])`; errors on
+ * through public workspace source paths, object-schema dict spreads, and `z.intersect([X.Config, …])`; errors on
  * anything else, so a schema the walk cannot see fails the gate instead of
  * silently thinning it. Nested values that are neither `object` nor `array`
  * compositions (primitives, unions, dynamic-key dicts) contribute no paths.
@@ -568,6 +570,22 @@ function walkSchemaExpr(
           const key = ts.isStringLiteral(prop.name) ? prop.name.text : prop.name.getText(ctx.sf)
           keys.push(key)
           if (ts.isPropertyAssignment(prop)) collectValuePaths(prop.initializer, key)
+        } else if (ts.isSpreadAssignment(prop)) {
+          const spread = unwrapExpr(prop.expression)
+          if (!ts.isPropertyAccessExpression(spread) || spread.name.text !== 'dict' || !ts.isIdentifier(spread.expression)) {
+            violations.push(`${where}: schema spread '${prop.getText(ctx.sf)}' must name a const object schema's dict.`)
+            continue
+          }
+          try {
+            const target = schemaAlias(world, ctx, spread.expression.text)
+            const object = unwrapExpr(target.expr)
+            if (!ts.isCallExpression(object) || !ts.isPropertyAccessExpression(object.expression) || object.expression.name.text !== 'object') {
+              throw new Error(`schema spread '${spread.getText(ctx.sf)}' must refer directly to an object schema`)
+            }
+            visit(spread.expression)
+          } catch (error) {
+            violations.push(`${where}: ${error instanceof Error ? error.message : String(error)}.`)
+          }
         } else {
           violations.push(`${where}: schema object property '${prop.getText(ctx.sf)}' is not a plain key.`)
         }

@@ -6,12 +6,15 @@
  * @module @deepseek-ai/dsh-web
  */
 
-import { Context, Service } from '@deepseek-ai/cordis'
+import { Context, type Volatile } from '@deepseek-ai/cordis'
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import z from '@deepseek-ai/schemastery'
 import type {
   WebFetchProvider,
   WebFetchRequest,
   WebFetchResult,
+  WebProviderInfo,
+  WebProviderList,
   WebSearchProvider,
   WebSearchRequest,
   WebSearchResult,
@@ -26,6 +29,8 @@ export type {
   WebFetchProvider,
   WebFetchRequest,
   WebFetchResult,
+  WebProviderInfo,
+  WebProviderList,
   WebSearchProvider,
   WebSearchRequest,
   WebSearchResult,
@@ -49,18 +54,21 @@ interface Selection<P> {
 /**
  * Config for the web seam. `searchProvider` / `fetchProvider` pin which provider
  * wins for each capability; both are optional (a single registered usable
- * provider auto-selects). Operational overrides such as environment variables
- * must feed these same fields rather than introduce a hidden priority chain.
+ * provider auto-selects). Each operation reads the current value, so a settings
+ * change applies to the next search or fetch without remounting the service.
+ * Operational overrides such as environment variables must feed these same
+ * fields rather than introduce a hidden priority chain.
  */
 export interface WebRuntimeConfig {
   /** Explicit search provider id. Omitted = auto-select when exactly one usable. */
-  readonly searchProvider?: string
+  readonly searchProvider: Volatile<string | undefined>
   /** Explicit fetch provider id. Omitted = auto-select when exactly one usable. */
-  readonly fetchProvider?: string
+  readonly fetchProvider: Volatile<string | undefined>
 }
 
 /**
- * The web access service. Registered as `ctx.web` (one instance per context).
+ * The web access service. Registered as `ctx.web` (one instance per context)
+ * and exposed to Clients as the `web` Remote namespace (`listProviders`).
  *
  * Selection semantics (resolved at execution time, never order-dependent):
  * - A configured id that is registered and `available()` → that provider.
@@ -71,32 +79,34 @@ export interface WebRuntimeConfig {
  * - No id configured, multiple usable providers → `WEB_PROVIDER_AMBIGUOUS`.
  * - No id configured, no usable provider → `WEB_PROVIDER_UNAVAILABLE`.
  */
-export class WebRuntime extends Service {
+export class WebRuntime extends TypertRemoteService {
   /**
    * Provider selection config. Operational env overrides feed the SAME fields:
    * `$DSH_WEB_SEARCH_PROVIDER` / `$DSH_WEB_FETCH_PROVIDER` are equivalent to
    * `searchProvider` / `fetchProvider` and are NOT a hidden priority chain.
    */
-  static Config: z<WebRuntimeConfig> = z.object({
-    searchProvider: z.string(),
-    fetchProvider: z.string(),
+  static Config = z.object({
+    searchProvider: z.string().volatile(),
+    fetchProvider: z.string().volatile(),
   })
 
   private searchProviders = new Map<string, WebSearchProvider>()
   private fetchProviders = new Map<string, WebFetchProvider>()
-  private readonly searchProviderId: string | undefined
-  private readonly fetchProviderId: string | undefined
+  private readonly searchProviderEnv: string | undefined
+  private readonly fetchProviderEnv: string | undefined
 
-  constructor(ctx: Context, config: WebRuntimeConfig = {}) {
+  constructor(ctx: Context, private readonly config: WebRuntimeConfig) {
     super(ctx, 'web')
-    this.searchProviderId = config.searchProvider ?? process.env.DSH_WEB_SEARCH_PROVIDER
-    this.fetchProviderId = config.fetchProvider ?? process.env.DSH_WEB_FETCH_PROVIDER
+    this.searchProviderEnv = process.env.DSH_WEB_SEARCH_PROVIDER
+    this.fetchProviderEnv = process.env.DSH_WEB_FETCH_PROVIDER
   }
 
   /**
-   * Register a search provider. Throws {@link WebError} `WEB_DUPLICATE_PROVIDER`
-   * if its id is already registered for search. Returns a disposer; disposed
-   * with the calling fiber.
+   * Register a search provider. `listProviders()` lists it until the
+   * registration is disposed, which happens with the calling fiber or through
+   * the returned disposer; registration and disposal each emit
+   * `web/providers-changed`. Throws {@link WebError} `WEB_DUPLICATE_PROVIDER`
+   * if its id is already registered for search.
    * @param provider - the provider; its `id` is the registry key.
    * @returns the disposer that unregisters the provider.
    */
@@ -105,9 +115,9 @@ export class WebRuntime extends Service {
   }
 
   /**
-   * Register a fetch provider. Throws {@link WebError} `WEB_DUPLICATE_PROVIDER`
-   * if its id is already registered for fetch. Returns a disposer; disposed
-   * with the calling fiber.
+   * Register a fetch provider, with the listing, disposal, and event behavior
+   * of {@link WebRuntime.registerSearchProvider}. Throws {@link WebError}
+   * `WEB_DUPLICATE_PROVIDER` if its id is already registered for fetch.
    * @param provider - the provider; its `id` is the registry key.
    * @returns the disposer that unregisters the provider.
    */
@@ -119,13 +129,48 @@ export class WebRuntime extends Service {
     if (store.has(provider.id)) {
       throw new WebError(`a web provider with id "${provider.id}" is already registered`, 'WEB_DUPLICATE_PROVIDER')
     }
+    const emitChanged = (): void => { this.emitProvidersChanged() }
     const dispose = this.ctx.effect(function* () {
       store.set(provider.id, provider)
-      yield () => store.delete(provider.id)
+      emitChanged()
+      yield () => {
+        store.delete(provider.id)
+        emitChanged()
+      }
     }, 'web.registerProvider()')
     // ctx.effect's disposer returns Promise<void>; our disposer API is
     // synchronous fire-and-forget — discard the (always-resolved) promise.
     return () => void dispose()
+  }
+
+  /**
+   * List every registered search and fetch provider for provider pickers.
+   * Availability does not filter the lists.
+   * @returns detached `{ id, title, description }` entries per capability, in registration order.
+   */
+  @Remote
+  listProviders(): WebProviderList {
+    return {
+      search: [...this.searchProviders.values()].map(providerInfo),
+      fetch: [...this.fetchProviders.values()].map(providerInfo),
+    }
+  }
+
+  /** Emit `web/providers-changed`, containing each listener's failure so none vetoes the mutation. */
+  private emitProvidersChanged(): void {
+    for (const listener of this.ctx.events.dispatch('emit', ['web/providers-changed'])) {
+      try {
+        const returned: unknown = listener()
+        void Promise.resolve(returned).catch((error: unknown) => { this.warnListenerFailure(error) })
+      } catch (error: unknown) {
+        this.warnListenerFailure(error)
+      }
+    }
+  }
+
+  private warnListenerFailure(error: unknown): void {
+    this.ctx.logger.warn('web: a web/providers-changed listener failed')
+    this.ctx.logger.warn(error)
   }
 
   /**
@@ -138,12 +183,29 @@ export class WebRuntime extends Service {
    * @returns the provider's results, capped to `request.maxResults`.
    */
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const provider = resolveProvider({
-      providers: this.searchProviders,
-      ...this.searchProviderId !== undefined ? { configuredId: this.searchProviderId } : {},
-    })
-    const result = await provider.search(request, signal)
+    const result = await this.selectSearchProvider().search(request, signal)
     return capSources(result, request.maxResults)
+  }
+
+  /**
+   * Whether the provider `search()` would select can authenticate a search made for a
+   * model request on the `llmProvider` chat route. Asks only that provider's `ready()`;
+   * one without `ready()` counts as ready. Makes no network calls. A selection failure
+   * answers true, because `search()` reports that failure as a structured `WebError`.
+   * @param llmProvider - the provider route id of the model request, when known.
+   * @returns false only when the selected provider reports that it cannot authenticate.
+   */
+  async searchReady(llmProvider?: string): Promise<boolean> {
+    return await selectedProviderReady(() => this.selectSearchProvider(), llmProvider)
+  }
+
+  /** Select the search provider with the rules above, throwing the matching {@link WebError}. */
+  private selectSearchProvider(): WebSearchProvider {
+    const configuredId = this.config.searchProvider.get() ?? this.searchProviderEnv
+    return resolveProvider({
+      providers: this.searchProviders,
+      ...configuredId !== undefined ? { configuredId } : {},
+    })
   }
 
   /**
@@ -155,17 +217,58 @@ export class WebRuntime extends Service {
    * @returns the retrieval outcome; non-2xx responses resolve descriptively.
    */
   async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
-    const provider = resolveProvider({
+    return await this.selectFetchProvider().fetch(request, signal)
+  }
+
+  /**
+   * Whether the provider `fetch()` would select can authenticate a fetch made for a
+   * model request on the `llmProvider` chat route. Asks only that provider's `ready()`;
+   * one without `ready()` counts as ready. Makes no network calls. A selection failure
+   * answers true, because `fetch()` reports that failure as a structured `WebError`.
+   * @param llmProvider - the provider route id of the model request, when known.
+   * @returns false only when the selected provider reports that it cannot authenticate.
+   */
+  async fetchReady(llmProvider?: string): Promise<boolean> {
+    return await selectedProviderReady(() => this.selectFetchProvider(), llmProvider)
+  }
+
+  /** Select the fetch provider with the rules above, throwing the matching {@link WebError}. */
+  private selectFetchProvider(): WebFetchProvider {
+    const configuredId = this.config.fetchProvider.get() ?? this.fetchProviderEnv
+    return resolveProvider({
       providers: this.fetchProviders,
-      ...this.fetchProviderId !== undefined ? { configuredId: this.fetchProviderId } : {},
+      ...configuredId !== undefined ? { configuredId } : {},
     })
-    return provider.fetch(request, signal)
+  }
+}
+
+/** Project one provider to its picker entry, omitting an absent title or description. */
+function providerInfo(provider: WebSearchProvider | WebFetchProvider): WebProviderInfo {
+  return {
+    id: provider.id,
+    ...provider.title === undefined ? {} : { title: provider.title },
+    ...provider.description === undefined ? {} : { description: provider.description },
   }
 }
 
 interface ResolvableProvider {
   readonly id: string
   available(): boolean
+  ready?(llmProvider: string | undefined): Promise<boolean>
+}
+
+/**
+ * Ask the provider an operation selects whether it can authenticate for one chat route.
+ * @param select - the operation's selection; throws its {@link WebError} when no provider qualifies.
+ * @param llmProvider - the provider route id of the model request, when known.
+ * @returns the provider's answer; true when it has no `ready()` or selection fails, because the
+ *   operation reports that failure itself.
+ */
+async function selectedProviderReady(select: () => ResolvableProvider, llmProvider: string | undefined): Promise<boolean> {
+  let provider: ResolvableProvider
+  try { provider = select() }
+  catch (_selectionFailure) { return true /* The operation surfaces the same failure when called. */ }
+  return await provider.ready?.(llmProvider) ?? true
 }
 
 /** Resolve the selected provider or throw the matching {@link WebError}. */

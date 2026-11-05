@@ -1,8 +1,7 @@
 /** Node-half composition diagnostics for package metadata and built client bundles. */
 
 import { Hash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { SourceMap } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -10,10 +9,43 @@ import { pathToFileURL } from 'node:url'
 import { runInNewContext } from 'node:vm'
 import { Context, FiberState, type Fiber } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { renderIndexInjections, type WebServer, type WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { renderIndexInjections, type WebServer, type WebResourceRoute, type WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import * as modulesClient from '../src/client/index.ts'
 import { ClientModuleRegistry, bootInjections, orderByModuleGraph } from '../src/index.ts'
 import type { ClientModuleLoaderTarget, WebBootEntry, WebBootGraph } from '../src/client/index.ts'
+
+/**
+ * Paths whose synchronous read refuses, as a browser Worker refuses a file
+ * whose bytes arrive only through an asynchronous fetch.
+ */
+const syncRefused = vi.hoisted(() => new Set<string>())
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    readFileSync: ((path: Parameters<typeof actual.readFileSync>[0], ...rest: unknown[]) => {
+      if (syncRefused.has(String(path))) {
+        throw Object.assign(new Error(`synchronous read refused for ${String(path)}`), { code: 'ERR_DSH_VFS_DEFERRED' })
+      }
+      return (actual.readFileSync as (...args: unknown[]) => unknown)(path, ...rest)
+    }) as typeof actual.readFileSync,
+  }
+})
+
+/** Paths whose next asynchronous read fails once, as a lazily fetched file whose download fails. */
+const asyncFailOnce = vi.hoisted(() => new Set<string>())
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    readFile: ((path: Parameters<typeof actual.readFile>[0], ...rest: unknown[]) => {
+      if (typeof path === 'string' && asyncFailOnce.delete(path)) return Promise.reject(new Error(`download failed for ${path}`))
+      return (actual.readFile as (...args: unknown[]) => unknown)(path, ...rest)
+    }) as typeof actual.readFile,
+  }
+})
 
 const MODULES_ID = '@deepseek-ai/dsh-client-modules'
 const UI_RENDERER_ID = '@deepseek-ai/dsh-client-ui-renderer'
@@ -35,7 +67,7 @@ const BOOTSTRAP_URL = comboReference([MODULES_ID], 'boot')
 const APPLICATION_URL = comboReference([UI_RENDERER_ID], 'app')
 
 let root: string | undefined
-const contexts: { ctx: Context; ready?: Promise<WebRoute> }[] = []
+const contexts: { ctx: Context; ready?: Promise<WebResourceRoute> }[] = []
 
 afterEach(async () => {
   await Promise.all(contexts.splice(0).map(async ({ ctx, ready }) => {
@@ -44,6 +76,7 @@ afterEach(async () => {
   }))
   if (root !== undefined) rmSync(root, { recursive: true, force: true })
   root = undefined
+  syncRefused.clear()
 })
 
 it.each([false, true])('tracks the Web carrier lifetime when server-first is %s', async (serverFirst) => {
@@ -77,6 +110,24 @@ it.each([false, true])('tracks the Web carrier lifetime when server-first is %s'
   await expect.poll(() => routes.size).toBe(1)
   await modules.dispose()
   expect(routes.size).toBe(0)
+})
+
+it('publishes this package version and the build commit as the Host release in every composed graph', async () => {
+  const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }
+  const mount = async (commit: string | undefined) => {
+    vi.stubEnv('DSH_CLIENT_COMMIT_HASH', commit)
+    const ctx = new Context()
+    contexts.push({ ctx })
+    ctx.provide('loader', { entries: () => [] })
+    await ctx.plugin(ClientModuleRegistry)
+    vi.unstubAllEnvs()
+    return ctx.get('clientModules')!.graph()
+  }
+  const graph = await mount('abc1234')
+  expect(graph.release).toEqual({ version, commit: 'abc1234' })
+  expect(bootInjections(graph).at(-1)).toEqual({ kind: 'global', name: '__DSH_BOOT__', value: graph })
+  expect(modulesClient.parseBootManifest(graph).release).toEqual({ version, commit: 'abc1234' })
+  expect((await mount(undefined)).release).toEqual({ version })
 })
 
 /** Create a resolvable package whose client export points at the returned path. */
@@ -113,8 +164,9 @@ function constructWithRoute(
     contextBaseUrl?: string
     entryBaseUrl?: string
     internal?: NonNullable<Context['loader']['internal']>
+    onEntries?: () => void
   } = {},
-): { context: Context; service: ClientModuleRegistry; route: Promise<WebRoute> } {
+): { context: Context; service: ClientModuleRegistry; route: Promise<WebResourceRoute> } {
   const ctx = new Context()
   const owned: typeof contexts[number] = { ctx }
   contexts.push(owned)
@@ -122,6 +174,7 @@ function constructWithRoute(
   ctx.provide('loader', {
     internal: options.internal,
     *entries() {
+      options.onEntries?.()
       for (const packageName of packageNames) {
         yield {
           options: { name: packageName },
@@ -132,11 +185,11 @@ function constructWithRoute(
       }
     },
   })
-  const route = Promise.withResolvers<WebRoute>()
+  const route = Promise.withResolvers<WebResourceRoute>()
   const webServer: Pick<WebServer, 'port' | 'register' | 'tapIndex'> = {
     port: 0,
     register: (candidate) => {
-      if (candidate.path === '/plugins') route.resolve(candidate)
+      if (candidate.path === '/plugins' && 'resource' in candidate) route.resolve(candidate)
       return () => {}
     },
     tapIndex: () => () => {},
@@ -152,28 +205,15 @@ function construct(packageNames: string[]): ClientModuleRegistry {
   return constructWithRoute(packageNames).service
 }
 
-/** Invoke the registered plugin route and capture status, headers, and bytes. */
-async function routeRequest(route: Promise<WebRoute>, url: string, method = 'GET'): Promise<{
+/** Invoke the registered plugin resource and capture status, headers, and bytes. */
+async function routeRequest(route: Promise<WebResourceRoute>, url: string, method = 'GET'): Promise<{
   status: number
-  headers: Record<string, string> | undefined
+  headers: Record<string, string>
   body: Buffer
 }> {
-  let status = 0
-  let headers: Record<string, string> | undefined
-  let body = Buffer.alloc(0)
-  const response = {
-    writeHead(nextStatus: number, nextHeaders?: Record<string, string>) {
-      status = nextStatus
-      headers = nextHeaders
-      return response
-    },
-    end(chunk?: Uint8Array) {
-      body = chunk === undefined ? Buffer.alloc(0) : Buffer.from(chunk)
-      return response
-    },
-  } as unknown as ServerResponse
-  await (await route).handler({ method, url } as IncomingMessage, response)
-  return { status, headers, body }
+  const { resource } = await route
+  const response = await resource(new Request(new URL(url, 'http://localhost/'), { method }))
+  return { status: response.status, headers: Object.fromEntries(response.headers), body: Buffer.from(await response.arrayBuffer()) }
 }
 
 /** Execute the exact first inline script emitted by the Host boot rows. */
@@ -291,6 +331,148 @@ describe('HTML bootstrap facade', () => {
 })
 
 describe('client bundle activation', () => {
+  it('enumerates Loader entries once per dirty-name batch and skips empty batches', async () => {
+    const names = ['@fixture/scan-first', '@fixture/scan-second', '@fixture/scan-retained']
+    for (const name of names) writeBuiltPackage(name, {})
+    const scans = vi.fn()
+    const { context, service } = constructWithRoute(names, { onEntries: scans })
+
+    expect(scans).toHaveBeenCalledTimes(2)
+    expect(service.graph().entries).toHaveLength(3)
+    scans.mockClear()
+
+    const removed = names.splice(0, 2)
+    for (const name of [...removed, removed[0]!]) emitLoaderEntryChange(context, name)
+    await Promise.resolve()
+
+    expect(scans).toHaveBeenCalledTimes(1)
+    expect(service.graph().entries.map(entry => entry.id)).toEqual(names)
+    for (const name of removed) expect(service.clientPath(name)).toBeUndefined()
+
+    scans.mockClear()
+    context.emit('internal/plugin', context.fiber)
+    await Promise.resolve()
+    expect(scans).not.toHaveBeenCalled()
+
+    const emptyScans = vi.fn()
+    const empty = constructWithRoute([], { onEntries: emptyScans })
+    expect(empty.service.graph().entries).toEqual([])
+    expect(emptyScans).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a shared source until its last same-name Loader entry unloads', async () => {
+    const name = '@fixture/shared-source-owners'
+    writeBuiltPackage(name, {})
+    const names = [name, name]
+    const { context, service } = constructWithRoute(names)
+    const initial = service.graph()
+
+    names.pop()
+    emitLoaderEntryChange(context, name)
+    await Promise.resolve()
+    expect(service.graph()).toBe(initial)
+    expect(service.clientPath(name)).toBeDefined()
+
+    names.pop()
+    emitLoaderEntryChange(context, name)
+    await Promise.resolve()
+    expect(service.graph().entries).toEqual([])
+    expect(service.clientPath(name)).toBeUndefined()
+  })
+
+  it('reports an activation flush enumeration failure as a composition error', () => {
+    const name = '@fixture/failed-activation-scan'
+    writeBuiltPackage(name, {})
+    const scans = vi.fn()
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw new Error('Loader enumeration failed') })
+    expect(() => constructWithRoute([name], { onEntries: scans })).toThrow(AggregateError)
+  })
+
+  it.each([new Error('Loader enumeration failed'), 'Loader enumeration failed'])(
+    'retains the graph and consumes the failed batch when Loader enumeration throws %s',
+    async (failure) => {
+      const names = ['@fixture/failed-scan-first', '@fixture/failed-scan-second', '@fixture/failed-scan-retained']
+      for (const name of names) writeBuiltPackage(name, {})
+      const scans = vi.fn()
+      const { context, service, route } = constructWithRoute(names, { onEntries: scans })
+      await route
+      const initial = service.graph()
+      const warning = vi.spyOn(context.logger, 'warn').mockImplementation(() => undefined)
+      const removed = names.splice(0, 2)
+      scans.mockImplementationOnce(() => { throw failure })
+      const callbacks: VoidFunction[] = []
+      const enqueue = vi.spyOn(globalThis, 'queueMicrotask').mockImplementation(callback => callbacks.push(callback))
+      try {
+        for (const name of removed) emitLoaderEntryChange(context, name)
+        expect(callbacks).toHaveLength(1)
+        expect(callbacks[0]!).not.toThrow()
+      } finally {
+        enqueue.mockRestore()
+      }
+      expect(warning).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'Loader enumeration failed' }))
+      expect(service.graph()).toBe(initial)
+      for (const name of removed) expect(service.clientPath(name)).toBeDefined()
+
+      emitLoaderEntryChange(context, names[0]!)
+      await Promise.resolve()
+      expect(service.graph()).toBe(initial)
+
+      for (const name of removed) emitLoaderEntryChange(context, name)
+      await Promise.resolve()
+      expect(service.graph().entries.map(entry => entry.id)).toEqual(names)
+      for (const name of removed) expect(service.clientPath(name)).toBeUndefined()
+    },
+  )
+
+  it.each(['processing', 'processed'] as const)('consumes pending names once when a %s name is marked again', async (timing) => {
+    const firstName = '@fixture/reentrant-first'
+    const secondName = '@fixture/reentrant-second'
+    const thirdName = '@fixture/reentrant-third'
+    const names = [firstName, secondName, thirdName]
+    const hostUrls = new Map<string, string>()
+    for (const name of names) {
+      writeBuiltPackage(name, {})
+      const hostPath = join(root!, 'node_modules', ...name.split('/'), 'lib', 'index.js')
+      writeFileSync(hostPath, 'export default {}\n')
+      hostUrls.set(name, pathToFileURL(hostPath).href)
+    }
+    const resolved: string[] = []
+    let duringResolve = (_name: string) => {}
+    const internal = {
+      version: 'v2' as const,
+      resolveSync: (_baseUrl: string, { specifier }: { specifier: string }) => {
+        resolved.push(specifier)
+        duringResolve(specifier)
+        return { format: 'module' as const, url: hostUrls.get(specifier)! }
+      },
+    }
+    const { context, service } = constructWithRoute(names, {
+      internal: internal as NonNullable<Context['loader']['internal']>,
+    })
+    const initial = service.graph()
+    resolved.length = 0
+    duringResolve = (name) => {
+      if (name === firstName) {
+        emitLoaderEntryChange(context, secondName)
+        emitLoaderEntryChange(context, thirdName)
+        if (timing === 'processing') emitLoaderEntryChange(context, firstName)
+      } else if (name === secondName) {
+        if (timing === 'processed') emitLoaderEntryChange(context, firstName)
+        duringResolve = () => {}
+      }
+    }
+
+    emitLoaderEntryChange(context, firstName)
+    emitLoaderEntryChange(context, secondName)
+    await Promise.resolve()
+    expect(resolved.splice(0)).toEqual([firstName, secondName])
+
+    await Promise.resolve()
+    expect(resolved).toEqual([thirdName, firstName])
+    expect(service.graph()).toBe(initial)
+  })
+
   it.each(['v1', 'v2'] as const)(
     'resolves %s package metadata from the owning entry tree',
     (version) => {
@@ -851,7 +1033,7 @@ describe('client bundle activation', () => {
     expect(batch).toMatchObject({ phase: 'application', entries: [packageName] })
     const batchScript = await routeRequest(route, batch.url)
     expect(batchScript.status).toBe(200)
-    expect(batchScript.headers?.['cache-control']).toBe('public, max-age=31536000, immutable')
+    expect(batchScript.headers['cache-control']).toBe('public, max-age=31536000, immutable')
     expect(batchScript.body.toString('utf8')).toContain(`//# sourceMappingURL=${mapReference(batch.url)}`)
     const shellResponse = await service.fetchBundle(new Request(`dsh-app://app/${batch.url}`))
     expect(shellResponse.status).toBe(200)
@@ -913,6 +1095,87 @@ describe('client bundle activation', () => {
     expect(chunk.body.toString('utf8')).toContain(`sourceMappingURL=${chunkMapReference('client.terminal.js', row.rev)}`)
     expect((await routeRequest(route, url.replace('.js?', '.js.map?'))).status).toBe(200)
     expect((await routeRequest(route, url.replace(`rev=${row.rev}`, 'rev=stale'))).status).toBe(404)
+  })
+
+  it('serves a chunk of a package named @scope/assets instead of treating it as an asset request', async () => {
+    const packageName = '@fixture/assets'
+    const clientPath = writePackage(packageName)
+    mkdirSync(dirname(clientPath), { recursive: true })
+    writeFileSync(clientPath, 'module.exports = {}\n')
+    writeFileSync(join(dirname(clientPath), 'client.extra.js'), 'module.exports = { marker: "extra chunk" }\n')
+    const { service, route } = constructWithRoute([packageName])
+    const row = service.graph().entries[0]!
+
+    const chunk = await routeRequest(route, chunkReference(packageName, 'client.extra.js', row.rev))
+    expect(chunk.status).toBe(200)
+    expect(chunk.body.toString('utf8')).toContain('extra chunk')
+  })
+
+  it('reads a package-local chunk and its map body only through the asynchronous filesystem face', async () => {
+    const packageName = '@fixture/async-chunk'
+    const clientPath = writePackage(packageName)
+    const chunkPath = join(dirname(clientPath), 'client.pdf.js')
+    mkdirSync(dirname(clientPath), { recursive: true })
+    writeFileSync(clientPath, 'module.exports = { load: () => require.async("./client.pdf.js") }\n')
+    writeFileSync(chunkPath, 'module.exports = { marker: "pdf loaded" }\n')
+    syncRefused.add(chunkPath)
+    const { service, route } = constructWithRoute([packageName])
+    const row = service.graph().entries[0]!
+    const url = chunkReference(packageName, 'client.pdf.js', row.rev)
+
+    const chunk = await routeRequest(route, url)
+    expect(chunk.status).toBe(200)
+    expect(chunk.body.toString('utf8')).toContain('pdf loaded')
+    const map = await routeRequest(route, url.replace('.js?', '.js.map?'))
+    expect(map.status).toBe(200)
+    expect(JSON.parse(map.body.toString('utf8'))).toMatchObject({ version: 3 })
+  })
+
+  it('reads a package-local chunk again after its first asynchronous read fails', async () => {
+    const packageName = '@fixture/retried-chunk'
+    const clientPath = writePackage(packageName)
+    const chunkPath = join(dirname(clientPath), 'client.excel.js')
+    mkdirSync(dirname(clientPath), { recursive: true })
+    writeFileSync(clientPath, 'module.exports = { load: () => require.async("./client.excel.js") }\n')
+    writeFileSync(chunkPath, 'module.exports = { marker: "excel loaded" }\n')
+    asyncFailOnce.add(chunkPath)
+    const { service, route } = constructWithRoute([packageName])
+    const url = chunkReference(packageName, 'client.excel.js', service.graph().entries[0]!.rev)
+
+    await expect(routeRequest(route, url)).rejects.toThrow(`download failed for ${chunkPath}`)
+    const retried = await routeRequest(route, url)
+    expect(retried.status).toBe(200)
+    expect(retried.body.toString('utf8')).toContain('excel loaded')
+  })
+
+  it('loads a renamed browser export at the logical URL without exposing Node bundles as chunks', async () => {
+    const packageName = '@fixture/dual-client'
+    const legacyPath = writePackage(packageName, {
+      dsh: { client: { platform: 'web' } },
+      exports: {
+        './client': {
+          types: './lib/types/client/index.d.ts',
+          node: './lib/client.node.js',
+          browser: './lib/client.browser.js',
+          default: './lib/client.browser.js',
+        },
+        './package.json': './package.json',
+      },
+    })
+    mkdirSync(dirname(legacyPath), { recursive: true })
+    writeFileSync(join(dirname(legacyPath), 'client.browser.js'), 'module.exports = { browser: true }\n')
+    for (const name of ['client.node.js', 'client.node.helper.js']) {
+      writeFileSync(join(dirname(legacyPath), name), 'throw new Error("Node code must not reach a browser")\n')
+    }
+    const { service, route } = constructWithRoute([packageName])
+    const row = service.graph().entries[0]!
+    expect(row.url).toContain(`${packageName}/client.js`)
+    expect((await routeRequest(route, row.url)).body.toString('utf8')).toContain('browser: true')
+    for (const name of ['client.node.js', 'client.node.helper.js']) {
+      for (const suffix of ['', '.map']) {
+        expect((await routeRequest(route, chunkReference(packageName, name + suffix, row.rev))).status).toBe(404)
+      }
+    }
   })
 
   it('publishes a new chunk revision when a completed build rewrites only the entry timestamp', async () => {
@@ -1124,5 +1387,74 @@ describe('module graph order', () => {
     writeBuiltPackage('@fixture/cycle-b', { external: ['@fixture/cycle-a'] })
     expect(() => construct(['@fixture/cycle-a', '@fixture/cycle-b']))
       .toThrow('module graph cycle @fixture/cycle-a -> @fixture/cycle-b -> @fixture/cycle-a')
+  })
+})
+
+describe('package manifest refresh', () => {
+  /** Rewrite a fixture package's manifest; its client bundle is left as it is. */
+  const writeManifest = (packageName: string, manifest: Record<string, unknown>): void => {
+    writeFileSync(join(root!, 'node_modules', ...packageName.split('/'), 'package.json'), JSON.stringify({ name: packageName, ...manifest }))
+  }
+  const clientManifest = (client: Record<string, unknown>, clientExport = './lib/client.js'): Record<string, unknown> => ({
+    exports: { './client': clientExport, './package.json': './package.json' },
+    dsh: { client: { platform: 'web', ...client } },
+  })
+
+  it('publishes a reinstalled declaration when its Loader entry restarts, and nothing for an unchanged restart', async () => {
+    const packageName = '@fixture/refresh-declaration'
+    writeBuiltPackage(packageName, { external: ['react'] })
+    const { context, service } = constructWithRoute([packageName])
+    const before = service.graph().entries[0]!
+    const changed = vi.fn()
+    service.onGraphChanged(changed)
+    const warning = vi.spyOn(context.logger, 'warn')
+    // An unchanged restart compares bundle metadata and never reads the bundle.
+    syncRefused.add(service.clientPath(packageName)!)
+
+    emitLoaderEntryChange(context, packageName)
+    await Promise.resolve()
+    expect(changed).not.toHaveBeenCalled()
+    expect(warning).not.toHaveBeenCalled()
+    syncRefused.delete(service.clientPath(packageName)!)
+
+    writeManifest(packageName, clientManifest({ external: ['scheduler'], inject: ['@fixture/slots'] }))
+    emitLoaderEntryChange(context, packageName)
+    await Promise.resolve()
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(service.graph().entries[0]).toMatchObject({ rev: before.rev, external: ['scheduler'], inject: ['@fixture/slots'] })
+  })
+
+  it('reads a moved client export as a new bundle generation when its Loader entry restarts', async () => {
+    const packageName = '@fixture/refresh-moved'
+    writeBuiltPackage(packageName, {})
+    const { context, service } = constructWithRoute([packageName])
+    const before = service.graph().entries[0]!
+    const moved = join(root!, 'node_modules', '@fixture', 'refresh-moved', 'dist', 'client.js')
+    mkdirSync(dirname(moved), { recursive: true })
+    writeFileSync(moved, 'module.exports = { moved: true }\n')
+    writeManifest(packageName, clientManifest({}, './dist/client.js'))
+
+    emitLoaderEntryChange(context, packageName)
+    await Promise.resolve()
+    expect(service.clientPath(packageName)).toBe(moved)
+    expect(service.graph().entries[0]!.rev).not.toBe(before.rev)
+  })
+
+  it('adds or removes the row when a restarted package gains or loses its client declaration', async () => {
+    const packageName = '@fixture/refresh-membership'
+    writeBuiltPackage(packageName, {})
+    writeManifest(packageName, { exports: { './package.json': './package.json' } })
+    const { context, service } = constructWithRoute([packageName])
+    expect(service.graph().entries).toEqual([])
+
+    writeManifest(packageName, clientManifest({}))
+    emitLoaderEntryChange(context, packageName)
+    await Promise.resolve()
+    expect(service.graph().entries.map(entry => entry.id)).toEqual([packageName])
+
+    writeManifest(packageName, { exports: { './package.json': './package.json' } })
+    emitLoaderEntryChange(context, packageName)
+    await Promise.resolve()
+    expect(service.graph().entries).toEqual([])
   })
 })

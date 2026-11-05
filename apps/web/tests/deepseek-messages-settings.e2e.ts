@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chromium, type Browser, type Page } from 'playwright'
+import { chromium, webkit, type Browser, type Page } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import {
   captureStableAria, compareOrRefreshGolden, launchWebScaffold,
@@ -11,6 +11,45 @@ import {
 import { openSettings, connectFreshWorkspaceZh, saveFailureShot, ZH_BROWSER_LOCALE } from './support.ts'
 
 const EXPECTED = fileURLToPath(new URL('./expected/deepseek-messages-settings/', import.meta.url))
+
+it.each([{ name: 'Chromium', engine: chromium }, { name: 'WebKit', engine: webkit }])(
+  'keeps a foreign model drag from editing another provider input in $name', async ({ engine }) => {
+    const scaffold = await launchWebScaffold({ deepSeekMissingCredential: true })
+    let browser: Browser | undefined
+    try {
+      browser = await engine.launch()
+      const page = await browser.newPage({ viewport: { width: 1680, height: 1000 }, locale: ZH_BROWSER_LOCALE })
+      const tripwire = watchConsole(page)
+      await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+      await page.getByRole('dialog', { name: '开始使用', exact: true }).getByRole('button', { name: '添加 API Key', exact: true }).click()
+      await page.getByRole('dialog', { name: '添加一个 API Key 开始使用' }).getByRole('button', { name: '稍后配置' }).click()
+      await openSettings(page, 'zh')
+      const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+      await dialog.getByRole('button', { name: '模型', exact: true }).click()
+      const setup = dialog.getByText('DeepSeek', { exact: true }).locator('xpath=ancestor::li')
+      await setup.getByText('自定义设置', { exact: true }).click()
+      await dialog.getByRole('button', { name: '添加模型提供商' }).click()
+      await dialog.getByRole('tab', { name: '自定义模型 API' }).click()
+      const custom = dialog.getByRole('tabpanel', { name: '自定义模型 API' })
+      await custom.getByRole('button', { name: '添加模型', exact: true }).click()
+      const target = custom.getByLabel('模型 ID 1', { exact: true })
+      await target.fill('foreign-model')
+      const before = scaffold.ctx.settings.describe({ redactSecrets: true }).map(row => ({ ns: row.ns, value: row.value }))
+      const source = setup.getByRole('button', { name: '调整模型顺序 1', exact: true })
+      await source.dragTo(target)
+      expect(await target.inputValue()).toBe('foreign-model')
+      expect(await setup.getByLabel('模型 ID 1', { exact: true }).inputValue()).toBe('deepseek-flash')
+      expect(scaffold.ctx.settings.describe({ redactSecrets: true }).map(row => ({ ns: row.ns, value: row.value }))).toEqual(before)
+      expect(tripwire.pageErrors).toEqual([])
+    } finally {
+      try {
+        await browser?.close()
+      } finally {
+        await scaffold.close()
+      }
+    }
+  }, 60_000,
+)
 
 describe.skipIf(webSnapshotMode() === 'record')('web e2e: DeepSeek Messages settings', () => {
   let scaffold: WebScaffold
@@ -39,6 +78,7 @@ describe.skipIf(webSnapshotMode() === 'record')('web e2e: DeepSeek Messages sett
     expect(scaffold.ctx.llm.listProviders()).toContainEqual({ id: 'deepseek-official', name: 'DeepSeek' })
     expect(scaffold.ctx.llm.listProviders().filter(provider => provider.id === 'deepseek-official')).toHaveLength(1)
     expect(scaffold.ctx.agentDefaultModel.currentSelection()).toEqual({ provider: 'deepseek-official', model: 'deepseek-flash' })
+    await page.getByRole('dialog', { name: '开始使用', exact: true }).getByRole('button', { name: '添加 API Key', exact: true }).click()
     const onboarding = page.getByRole('dialog', { name: '添加一个 API Key 开始使用' })
     await onboarding.getByLabel('API 密钥', { exact: true }).fill('sk-messages-onboarding')
     await onboarding.getByRole('button', { name: '保存并继续' }).click()
@@ -52,7 +92,7 @@ describe.skipIf(webSnapshotMode() === 'record')('web e2e: DeepSeek Messages sett
     const messages = dialog
     await messages.getByText('自定义设置', { exact: true }).click()
     expect(await messages.getByLabel('API 地址', { exact: true }).getAttribute('placeholder'))
-      .toBe('https://api.deepseek.com/anthropic')
+      .toBe('https://api.deepseek.com/anthropic（默认使用环境 DEEPSEEK_BASE_URL）')
     await compareOrRefreshGolden(join(EXPECTED, 'cards.expected.md'),
       await captureStableAria(page, '[role="dialog"]', scaffold.workspaceCwd), webSnapshotMode())
     await messages.getByLabel('API 密钥', { exact: true }).fill('sk-e2e-messages')
@@ -94,18 +134,24 @@ describe.skipIf(webSnapshotMode() === 'record')('web e2e: DeepSeek Messages sett
     onTestFailed(() => saveFailureShot(page, 'web-e2e-deepseek-messages-default'))
     await page.keyboard.press('Escape')
     await scaffold.ctx.agentDefaultModel.saveSelection({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+    const patchPath = join(scaffold.harnessHome, 'profiles', 'scaffold', 'cordis.patch.yml')
+    expect(await readFile(patchPath, 'utf8')).toContain('model: deepseek-v4-flash')
     await page.reload({ waitUntil: 'load' })
     const input = page.locator('[data-composer-input]').first()
-    const trigger = page.getByRole('button', { name: /^选择模型.*deepseek-official\/deepseek-v4-flash/ })
+    const trigger = page.getByRole('button', { name: '请选择模型', exact: true })
     await trigger.waitFor()
+    expect(scaffold.ctx.agentDefaultModel.currentSelection()).toEqual({
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })
     await expect.poll(() => input.getAttribute('contenteditable')).toBe('true')
     await trigger.click()
-    await page.getByRole('menuitem', { name: /模型/ }).click()
     await page.getByRole('menuitemradio', { name: 'Messages Flash', exact: true }).click()
     await expect.poll(() => input.getAttribute('contenteditable')).toBe('true')
-    await expect.poll(() => scaffold.ctx.agentDefaultModel.currentSelection().provider).toBe('deepseek-official')
-    const settings = await readFile(join(scaffold.harnessHome, 'profiles', 'scaffold', 'cordis.patch.yml'), 'utf8')
-    expect(settings).toContain('provider: deepseek-official')
+    await expect.poll(() => scaffold.ctx.agentDefaultModel.currentSelection()).toMatchObject({
+      provider: 'deepseek-official', model: 'deepseek-flash',
+    })
+    const settings = await readFile(patchPath, 'utf8')
+    expect(settings).not.toContain('id: agent-default-model')
     expect(tripwire.pageErrors).toEqual([])
   }, 60_000)
 })

@@ -199,10 +199,10 @@ export function renderPersistenceReview(report: PersistenceReview): string {
       `Before: ${item.before === null ? 'absent' : code(item.before)}; after: ${item.after === null ? 'absent' : code(item.after)}.`, '',
       ...item.locations.map(location => `- ${code(location.path)}`), '', '</details>')
   }
-  lines.push('', '## Authoritative compatibility results', '')
+  lines.push('', '## Compatibility review requirements', '')
   for (const root of report.roots) {
-    lines.push(`### ${code(root.root)}`, '', `Decision: **${root.changes.some(change => change.requiresVersionBump) ? 'version-bump' : 'same-version'}**.`, '',
-      ...root.changes.map(change => `- ${code(change.path)}: ${change.description} (${code(change.kind)}; requiresVersionBump: ${String(change.requiresVersionBump)}).`), '')
+    lines.push(`### ${code(root.root)}`, '', `Assessment: **${root.changes.some(change => change.requiresCompatibilityReview) ? 'compatibility review required' : 'same-version allowed'}**.`, '',
+      ...root.changes.map(change => `- ${code(change.path)}: ${change.description} (${code(change.kind)}; requiresCompatibilityReview: ${String(change.requiresCompatibilityReview)}).`), '')
   }
   return lines.join('\n').trimEnd() + '\n'
 }
@@ -210,12 +210,12 @@ export function renderPersistenceReview(report: PersistenceReview): string {
 /**
  * Read two explicit inventory files and return Markdown or JSON without mutating either.
  * @param args - --before and --after paths, and optional --json.
- * @returns structural evidence and exact compatibility results.
+ * @returns structural evidence and per-root compatibility-review requirements.
  */
 export function runPersistenceReview(args: readonly string[]): string {
   const { values } = parseArgs({ args: [...args], options: { before: { type: 'string' }, after: { type: 'string' }, json: { type: 'boolean' } }, strict: true, allowPositionals: false })
   if (values.before === undefined || values.after === undefined) throw new Error('persistence review: --before and --after inventory paths are required')
-  const read = (path: string): PersistenceSchemaInventory => parsePersistenceSnapshot(JSON.parse(readFileSync(path, 'utf8')))
+  const read = (path: string): PersistenceSchemaInventory => parsePersistenceSnapshot(readFileSync(path, 'utf8'))
   const report = reviewPersistenceSchemas(read(values.before), read(values.after))
   return values.json ? JSON.stringify(report, null, 2) + '\n' : renderPersistenceReview(report)
 }

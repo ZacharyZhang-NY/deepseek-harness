@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
+import FsLocal from '@deepseek-ai/dsh-fs-local'
+import { PtcRuntime, type PtcRunRequest, type PtcRunResult, type PtcRunSpec } from '@deepseek-ai/dsh-ptc-runtime'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
@@ -8,13 +13,56 @@ import {
   mountAgentLoopTestDependencies,
   mountAgentLoopTestHarness,
   unsupportedInbox,
+  unsupportedModel,
 } from '../src/index.ts'
 
 function message(text: string) {
   return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
 }
 
+class FixtureRuntime extends PtcRuntime {
+  readonly language = 'typescript'
+  readonly isolation = 'fixture'
+  resolve(request: PtcRunRequest): PtcRunSpec {
+    return { ...request, cwd: request.cwd ?? process.cwd(), timeoutMs: request.timeoutMs ?? 1_000 }
+  }
+  run(): Promise<PtcRunResult> {
+    return Promise.resolve({ logs: [] })
+  }
+}
+
 describe('dsh-agent-loop-testkit', () => {
+  it('rejects an invalid program concurrency limit during prerequisite mounting', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(FixtureRuntime)
+      await expect(mountAgentLoopTestDependencies(ctx, {
+        tools: { mode: 'ptc', maxParallelSubCalls: 0 },
+      })).rejects.toThrow('maxParallelSubCalls')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('mounts the PTC executor with its runtime', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(FixtureRuntime)
+      await mountAgentLoopTestDependencies(ctx, { tools: { mode: 'ptc' } })
+      expect((await ctx.systemPrompt.assemble()).tools.map(tool => tool.name)).toEqual(['run_code'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects reads and changes through an unsupported Agent stub Model', () => {
+    const model = unsupportedModel()
+
+    expect(() => model.current()).toThrow('this test Agent does not support model selection')
+    expect(() => { model.select({ provider: 'mock', model: 'mock' }) })
+      .toThrow('this test Agent does not support model selection')
+  })
+
   it('rejects mutations through an unsupported Agent stub Inbox', () => {
     const inbox = unsupportedInbox()
 
@@ -34,6 +82,23 @@ describe('dsh-agent-loop-testkit', () => {
     await expect(mountAgentLoopTestHarness(ctx)).resolves.toBeDefined()
 
     await ctx.fiber.dispose()
+  })
+
+  it('keeps an existing filesystem when enabling working directories', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'testkit-filesystem-'))
+    const ctx = new Context()
+    try {
+      await ctx.plugin(FsLocal, { cwd: root })
+      await mountAgentLoopTestDependencies(ctx, { workingDirectory: true })
+      const harness = await mountAgentLoopTestHarness(ctx)
+      const agent = await harness.create(SessionId('existing-filesystem'), {}, { cwd: root })
+
+      expect(ctx.fs.processPath(await ctx.fs.resolve('.'))).toBe(await realpath(root))
+      await expect(ctx.workingDirectory.ensure(agent)).resolves.toBe(root)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('provides a mutable in-memory Inbox stub for structural Agent tests', () => {
@@ -89,7 +154,7 @@ describe('dsh-agent-loop-testkit', () => {
       time: 1,
       data: { target: 'next-turn', start: 99, inserted: [] },
     }])
-    expect(() => ctx.sessionProjections.stateOf(invalid, 'inbox'))
+    expect(() => ctx.sessionProjections.checkpoint(invalid).inbox?.val)
       .toThrow(/invalid persisted inbox splice/)
     expect(harness.claim(agent, 'next-turn', 3)).toEqual([step, turn])
     expect(claimed).toEqual([

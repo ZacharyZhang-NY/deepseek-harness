@@ -11,6 +11,8 @@ import {
 } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import {
+  catalogNames,
+  establishExternalCatalogChild,
   subagentCatalogProjectionDefinition,
 } from '../src/catalog.ts'
 import type { SubagentCatalogState } from '../src/catalog.ts'
@@ -51,12 +53,34 @@ function fact(
 }
 
 describe('subagent catalog projection', () => {
+  it('records an external child once with its label and creation time', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SessionStore)
+      const parent = ctx.sessions.create(header.id)
+      const before = Date.now()
+      establishExternalCatalogChild(parent, SessionId('external'), 'External work', 'agent-1')
+      const events = parent.snapshotEvents()
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({
+        type: 'subagent/catalog',
+        data: { version: 3, childId: 'external', mode: 'external', label: 'External work', name: 'agent-1' },
+      })
+      const entries = subagentCatalogProjectionDefinition.wire.view(fold(events))
+      expect(entries).toHaveLength(1)
+      expect(entries[0]!.createdAt).toBeGreaterThanOrEqual(before)
+      expect(entries[0]!.createdAt).toBeLessThanOrEqual(Date.now())
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('publishes detached catalog views and changes only for new own facts', async () => {
     const ctx = new Context()
     try {
       await ctx.plugin(SessionStore)
       await ctx.plugin(SessionProjectionRegistry)
-      ctx.sessionProjections.register(subagentCatalogProjectionDefinition)
+      await ctx.sessionProjections.register(subagentCatalogProjectionDefinition)
       const parent = ctx.sessions.create(header.id)
       const changes = vi.fn()
       ctx.sessionProjections.onChanged(changes)
@@ -157,15 +181,30 @@ describe('subagent catalog projection', () => {
 
   it.each([
     { version: 0, childId: 'child', childCreatedAt: 0, mode: 'unknown' },
+    { version: 1, childId: 'child', childCreatedAt: 0, mode: 'unknown', external: true },
+    { version: 1, childId: 'child', childCreatedAt: 0, mode: 'continuable', label: 'child', external: true },
+    { version: 1, childId: 'child', childCreatedAt: 0, mode: 'one-shot', external: true },
+    { version: 2, childId: 'child', childCreatedAt: 0, mode: 'external', external: true },
+    { version: 0, childId: 'child', childCreatedAt: 0, mode: 'external' },
+    { version: 1, childId: 'child', childCreatedAt: 0, mode: 'external' },
+    { version: 2, childId: 'child', childCreatedAt: 0, mode: 'one-shot' },
+    { version: 2, childId: 'child', childCreatedAt: 0, mode: 'unknown' },
     { version: 9, childId: 'child', childCreatedAt: 0, mode: 'one-shot' },
     { version: 0, childId: 'child', childCreatedAt: 0, mode: 'continuable' },
     { version: 0, childId: 'child', childCreatedAt: -1, mode: 'one-shot' },
+    { version: 3, childId: 'child', childCreatedAt: 0, mode: 'continuable', label: 'child' },
+    { version: 3, childId: 'child', childCreatedAt: 0, mode: 'continuable', label: 'child', name: 'lead' },
+    { version: 3, childId: 'child', childCreatedAt: 0, mode: 'continuable', label: 'child', name: 'Reviewer' },
+    { version: 3, childId: 'child', childCreatedAt: 0, mode: 'one-shot', name: 'reviewer' },
+    { version: 3, childId: 'child', childCreatedAt: 0, mode: 'unknown', name: 'reviewer' },
+    { version: 2, childId: 'child', childCreatedAt: 0, mode: 'external', name: 'reviewer' },
+    { version: 0, childId: 'child', childCreatedAt: 0, mode: 'continuable', label: 'child', name: 'reviewer' },
   ])('refuses to restore a catalog containing an invalid fact: %j', async (data) => {
     const ctx = new Context()
     try {
       await ctx.plugin(SessionStore)
       await ctx.plugin(SessionProjectionRegistry)
-      ctx.sessionProjections.register(subagentCatalogProjectionDefinition)
+      await ctx.sessionProjections.register(subagentCatalogProjectionDefinition)
       const events = [
         fact(0, 'valid-child', 0, { mode: 'one-shot' }),
         { type: 'subagent/catalog', seq: SessionSeq(1), time: 0, data } as unknown as SessionEvent,
@@ -174,5 +213,95 @@ describe('subagent catalog projection', () => {
     } finally {
       await ctx.fiber.dispose()
     }
+  })
+})
+
+
+describe('external catalog membership', () => {
+  it('restores external leaves alongside local and unknown children', () => {
+    const entry: SessionEvent<'subagent/catalog'> = {
+      type: 'subagent/catalog', seq: SessionSeq(0), time: 0,
+      data: { version: 2, childId: SessionId('external'), childCreatedAt: 1, mode: 'external', label: 'Review' },
+    }
+    const unknown: SessionEvent<'subagent/catalog'> = {
+      type: 'subagent/catalog', seq: SessionSeq(3), time: 0,
+      data: { version: 1, childId: SessionId('unreadable'), childCreatedAt: 3, mode: 'unknown' },
+    }
+    const state = fold([entry, fact(1, 'local', 2, { mode: 'continuable', label: 'Implement' }), unknown])
+    const restored = subagentCatalogProjectionDefinition.stateSchema.parse(JSON.parse(JSON.stringify(state)))
+    expect(subagentCatalogProjectionDefinition.wire.view(restored)).toEqual([
+      { id: SessionId('external'), createdAt: 1, mode: 'external', label: 'Review' },
+      { id: SessionId('local'), createdAt: 2, mode: 'continuable', label: 'Implement' },
+      { id: SessionId('unreadable'), createdAt: 3, mode: 'unknown' },
+    ])
+    expect(subagentCatalogProjectionDefinition.wire.view(fold([entry]))[0]).toMatchObject({ mode: 'external' })
+    const view = subagentCatalogProjectionDefinition.wire.view(restored)
+    expect(subagentCatalogProjectionDefinition.wire.viewSchema.parse(view)).toEqual(view)
+    expect(subagentCatalogProjectionDefinition.wire.viewSchema.safeParse([{ id: 'external', createdAt: 1, mode: 'external', external: true }]).success).toBe(false)
+  })
+})
+
+describe('named catalog membership', () => {
+  it('reuses version-6 unnamed checkpoints and folds only the named suffix', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SessionProjectionRegistry)
+      const apply = vi.fn(subagentCatalogProjectionDefinition.apply)
+      await ctx.sessionProjections.register({ ...subagentCatalogProjectionDefinition, apply })
+      const historical: SessionEvent<'subagent/catalog'>[] = [
+        fact(0, 'legacy-local', 1, { mode: 'continuable', label: 'Legacy' }),
+        { type: 'subagent/catalog', seq: SessionSeq(1), time: 0,
+          data: { version: 1, childId: SessionId('legacy-unknown'), childCreatedAt: 2, mode: 'unknown' } },
+        { type: 'subagent/catalog', seq: SessionSeq(2), time: 0,
+          data: { version: 2, childId: SessionId('legacy-external'), childCreatedAt: 3, mode: 'external' } },
+      ]
+      const suffix: SessionEvent<'subagent/catalog'>[] = [
+        { type: 'subagent/catalog', seq: SessionSeq(3), time: 0,
+          data: { version: 3, childId: SessionId('reviewer'), childCreatedAt: 4,
+            mode: 'continuable', label: 'Review', name: 'reviewer' } },
+        { type: 'subagent/catalog', seq: SessionSeq(4), time: 0,
+          data: { version: 3, childId: SessionId('auditor'), childCreatedAt: 5, mode: 'external', name: 'auditor' } },
+      ]
+      const checkpoint = { subagentCatalog: { ver: 6, seq: SessionSeq(2), val: {
+        inheritedEventCount: 0, head: { values: historical.map(event => event.data) },
+      } } }
+      expect(ctx.sessionProjections.restoreFloor(checkpoint)).toBe(2)
+      expect(ctx.sessionProjections.viewCheckpoint(checkpoint).subagentCatalog).toEqual([
+        { id: 'legacy-local', createdAt: 1, mode: 'continuable', label: 'Legacy' },
+        { id: 'legacy-unknown', createdAt: 2, mode: 'unknown' },
+        { id: 'legacy-external', createdAt: 3, mode: 'external' },
+      ])
+      expect(apply).not.toHaveBeenCalled()
+      const restored = ctx.sessionProjections.restore(checkpoint, suffix, SessionLogOffset(3), header, SessionLogOffset(0))
+      expect(apply.mock.calls.map(([, event]) => event)).toEqual(suffix)
+      const full = ctx.sessionProjections.restore({}, [...historical, ...suffix], SessionLogOffset(0), header, SessionLogOffset(0))
+      expect(restored).toEqual(full)
+      expect(restored.checkpoint['subagentCatalog']!.ver).toBe(6)
+      expect(restored.snapshot.values.subagentCatalog?.map(entry => 'name' in entry ? entry.name : undefined))
+        .toEqual([undefined, undefined, undefined, 'reviewer', 'auditor'])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('restores version-3 names beside unnamed historical children', () => {
+    const named: SessionEvent<'subagent/catalog'>[] = [
+      { type: 'subagent/catalog', seq: SessionSeq(1), time: 0,
+        data: { version: 3, childId: SessionId('reviewer'), childCreatedAt: 2, mode: 'continuable', label: 'Review', name: 'reviewer' } },
+      { type: 'subagent/catalog', seq: SessionSeq(2), time: 0,
+        data: { version: 3, childId: SessionId('auditor'), childCreatedAt: 3, mode: 'external', label: 'Audit', name: 'auditor' } },
+    ]
+    const state = fold([fact(0, 'historical', 1, { mode: 'continuable', label: 'Old work' }), ...named])
+    const view = subagentCatalogProjectionDefinition.wire.view(
+      subagentCatalogProjectionDefinition.stateSchema.parse(JSON.parse(JSON.stringify(state))),
+    )
+    expect(view).toEqual([
+      { id: SessionId('historical'), createdAt: 1, mode: 'continuable', label: 'Old work' },
+      { id: SessionId('reviewer'), createdAt: 2, mode: 'continuable', label: 'Review', name: 'reviewer' },
+      { id: SessionId('auditor'), createdAt: 3, mode: 'external', label: 'Audit', name: 'auditor' },
+    ])
+    expect(subagentCatalogProjectionDefinition.wire.viewSchema.parse(view)).toEqual(view)
+    expect(subagentCatalogProjectionDefinition.wire.viewSchema.safeParse([{ ...view[1], name: 'Bad name' }]).success).toBe(false)
+    expect(catalogNames(view)).toEqual(new Set(['reviewer', 'auditor']))
   })
 })

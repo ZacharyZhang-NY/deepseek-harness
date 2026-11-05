@@ -1,10 +1,11 @@
-import { memo, useCallback, useMemo, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { Fragment, memo, useCallback, useMemo, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import clsx from 'clsx'
 import {
   CodeBlock, DiffBlock, DisclosureRow, IconInspectOutlineRegular, ReadBlock, SearchBlock,
   TerminalBlock, TextShimmer, WebBlock,
   diffTotals,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { ContextMenuTriggerProps } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import type { PropsRenderSlots, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { OpenFileOptions, UseDisclosure } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { MessageImageLoader } from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -13,18 +14,19 @@ import { CHAT_READ_MAX_LINES, type ReadCardModel } from '../models/read-card-mod
 import type { ImageCardModel } from '../models/image-card-model.ts'
 import { CHAT_SEARCH_MAX_LINES, type SearchCardModel } from '../models/search-card-model.ts'
 import {
-  localizeTerminalCardModel, terminalBlockLabels, type TerminalCardModel,
+  localizeTerminalCardModel, terminalBlockLabels, terminalExitLabel, type TerminalCardModel,
 } from '../models/terminal-card-model.ts'
 import {
   codeToolbarLabels, diffBlockLabels, readBlockLabels, searchBlockLabels, webBlockLabels,
 } from '../models/primitive-labels.ts'
 import type { AskQuestionCardModel } from '../models/ask-question-card-model.ts'
 import {
-  formatToolBody, type ToolRowState, type ToolRowVariant,
+  FILE_TARGET_MOVE, FILE_TARGET_SEPARATOR, formatToolBody, type ToolRowFileTarget, type ToolRowState, type ToolRowVariant,
 } from '../models/tool-call-model.ts'
 import type { WebCardModelProps } from '../models/web-card-model.ts'
 import { AskQuestionCard } from './AskQuestionCard.tsx'
 import { ToolDetails, type ToolDetailsModel } from './ToolDetails.tsx'
+import { ExitCodeBadge } from './ExitCodeBadge.tsx'
 import css from './ToolRow.module.css'
 
 export interface ToolRowProps {
@@ -39,10 +41,9 @@ export interface ToolRowProps {
   summary: string
   /**
    * Trailing summary fragment rendered outside the ellipsized summary text, so
-   * a narrow row clips the summary before this. For a fragment whose whole
-   * value is surviving that clip — the todo row's parallel-active count.
-   * null/absent = the summary is the whole collapsed content. Dropped on an
-   * error row, whose collapsed summary is the failure line instead.
+   * a narrow row clips the summary before this. Appears before diff totals
+   * when both are present. null/absent omits this fragment. Error and stopped
+   * rows omit both the suffix and diff totals.
    */
   summarySuffix?: string | null | undefined
   /** Original argument JSON formatted only while the row is expanded. */
@@ -51,7 +52,10 @@ export interface ToolRowProps {
   output?: string | null | undefined
   /** Ask-user transcript card; card fields are mutually exclusive and replace text sections. */
   askQuestion?: AskQuestionCardModel | null | undefined
-  /** Error first line shown as the collapsed summary on an error row; null/absent = keep `summary`. */
+  /**
+   * First error line for rows without an exit status capsule; null/absent keeps
+   * the ordinary summary. Rows with an exit capsule retain the command description.
+   */
   errorSummary?: string | null | undefined
   /** Terminal card; card fields are mutually exclusive and replace text sections. */
   terminal?: TerminalCardModel | null | undefined
@@ -68,10 +72,10 @@ export interface ToolRowProps {
   /**
    * Dispatch the image gallery through the tool-owned `tool.call.images`
    * slot, supplied by the toolview that owns this row together with the
-   * session-authorized loader.
+   * Gateway-authorized loader.
    */
   renderSlot?: PropsRenderSlots<'tool.call.images'>['renderSlot'] | undefined
-  /** Session-authorized image URL loader for the gallery slot. */
+  /** Gateway-authorized image URL loader for the gallery slot. */
   loadImage?: MessageImageLoader | undefined
   search?: SearchCardModel | null | undefined
   web?: WebCardModelProps | null | undefined
@@ -79,14 +83,26 @@ export interface ToolRowProps {
   details?: ToolDetailsModel | null | undefined
   state: ToolRowState
   /**
-   * Filesystem path from tool args; when set with onOpenFile, the summary
-   * renders as a hover-underline link that opens the host default app.
+   * Recorded file target or a supported argument fallback. With onOpenFile,
+   * the summary opens that path through the owner's file-preview callback.
    */
   filePath?: string | undefined
   /** 1-based line the call was about; absent = open the file at its beginning. */
   filePathLine?: number | undefined
   /** Open the path (already cwd-resolved), landing on `filePathLine` when given. */
   onOpenFile?: ((path: string, options?: OpenFileOptions) => void) | undefined
+  /** File gesture bindings supplied by the owning tool view. */
+  fileContextMenuProps?: ContextMenuTriggerProps | undefined
+  /**
+   * Files a patch row names. When onOpenFile is set, the row state is `ok`, and
+   * at least one target has a `filePath`, each such target renders as its own
+   * link in place of the summary text; otherwise the row shows `summary`.
+   */
+  fileTargets?: readonly ToolRowFileTarget[] | undefined
+  /** File gesture bindings for one `fileTargets` path, supplied by the owning tool view. */
+  fileTargetContextMenuProps?: ((path: string) => ContextMenuTriggerProps) | undefined
+  /** URL gesture bindings supplied by the owning tool view. */
+  urlContextMenuProps?: ContextMenuTriggerProps | undefined
   /** Safe http(s) URL from tool args; when set, the summary renders as a link that opens it in a new tab. */
   href?: string | undefined
   /**
@@ -99,6 +115,35 @@ export interface ToolRowProps {
 /** Keep a summary link click from toggling the row; the browser still follows the link. */
 function stopLinkClick(event: MouseEvent<HTMLAnchorElement>): void {
   event.stopPropagation()
+}
+
+interface FileTargetLinkProps {
+  label: string
+  path: string
+  onOpenFile: (path: string, options?: OpenFileOptions) => void
+  contextMenuProps: ContextMenuTriggerProps | undefined
+  onLinkKeyDown: (event: KeyboardEvent<HTMLElement>) => void
+}
+
+/** One openable file inside a multi-file summary; activating it never toggles the row. */
+function FileTargetLink({ label, path, onOpenFile, contextMenuProps, onLinkKeyDown }: FileTargetLinkProps) {
+  return (
+    <button
+      type="button"
+      className={css.fileTargetLink}
+      {...contextMenuProps}
+      onClick={(event) => {
+        event.stopPropagation()
+        onOpenFile(path)
+      }}
+      onKeyDown={(event) => {
+        onLinkKeyDown(event)
+        contextMenuProps?.onKeyDown?.(event)
+      }}
+    >
+      {label}
+    </button>
+  )
 }
 
 /** Visually hidden run-state label for color-only running and settlement cues. */
@@ -143,6 +188,7 @@ export const ToolRow = memo(function ToolRow({
   filePath,
   filePathLine,
   onOpenFile,
+  fileContextMenuProps, urlContextMenuProps, fileTargets, fileTargetContextMenuProps,
   href,
   inspect,
   useDisclosure,
@@ -177,16 +223,15 @@ export const ToolRow = memo(function ToolRow({
   const status = stateStatus(state, t)
   const running = state === 'running' || state === 'preparing'
   const normalSummary = terminalBody?.description ?? (open ? detailsBody?.expandedSummary ?? summary : summary)
-  // A failure keeps its first result line when available and otherwise turns
-  // the ordinary summary red. An interruption turns the tool-owned summary
-  // amber while retaining the business icon and hidden state announcement.
-  const failureLine = state === 'error' ? errorSummary ?? normalSummary : null
+  const exitLabel = terminalExitLabel(terminal, t)
+  // Generic failures retain their first result line; command exits keep their description.
+  const failureLine = state === 'error' && exitLabel === null ? errorSummary ?? normalSummary : null
   const summaryText = failureLine ?? normalSummary
-  // The tool row keeps the diff's +/- totals visible while its body is collapsed.
-  // An explicit summarySuffix overrides the diff totals.
+  // Diff totals remain visible after the optional summary suffix.
   const diffStat = useMemo(() => diffBody === null ? null : diffTotals(diffBody.card.diffs), [diffBody])
   const settledWithCue = state === 'error' || state === 'stopped'
-  const suffix = settledWithCue ? null : summarySuffix ?? diffStat
+  const suffix = settledWithCue ? null : summarySuffix ?? null
+  const totals = settledWithCue ? null : diffStat
   const openFile = useMemo(() => filePath !== undefined && onOpenFile !== undefined && !settledWithCue
     ? (event: MouseEvent<HTMLButtonElement>) => {
       event.stopPropagation()
@@ -195,6 +240,10 @@ export const ToolRow = memo(function ToolRow({
     }
     : undefined, [filePath, filePathLine, onOpenFile, settledWithCue])
   const linkHref = settledWithCue ? undefined : href
+  // Per-file links appear only on a successful result: TextShimmer accepts no
+  // buttons, so running and failed rows keep the plain summary text.
+  const openTarget = state === 'ok' && fileTargets?.some(target => target.filePath !== undefined) === true
+    ? onOpenFile : undefined
   // Keep Enter/Space on the focused path or URL link from bubbling to the row's
   // keydown handler, which would preventDefault() the key and toggle expand
   // instead of activating the link — the keyboard analogue of the click
@@ -211,23 +260,49 @@ export const ToolRow = memo(function ToolRow({
        its title shows no trailing dot). */
     <>
       <span className={css.sep} data-shimmer-decoration aria-hidden />
-      {openFile !== undefined ? (
+      {exitLabel === null && fileTargets !== undefined && openTarget !== undefined ? (
+        <span className={css.fileLinks}>
+          {fileTargets.map((target, index) => (
+            <Fragment key={target.id}>
+              {index > 0 && FILE_TARGET_SEPARATOR}
+              {target.from !== undefined && `${target.from}${FILE_TARGET_MOVE}`}
+              {target.filePath === undefined ? target.label : (
+                <FileTargetLink
+                  label={target.label}
+                  path={target.filePath}
+                  onOpenFile={openTarget}
+                  contextMenuProps={fileTargetContextMenuProps?.(target.filePath)}
+                  onLinkKeyDown={summaryLinkKeyDown}
+                />
+              )}
+            </Fragment>
+          ))}
+        </span>
+      ) : exitLabel === null && openFile !== undefined ? (
         <button
           type="button"
           className={css.fileLink}
+          {...fileContextMenuProps}
           onClick={openFile}
-          onKeyDown={summaryLinkKeyDown}
+          onKeyDown={(event) => {
+            summaryLinkKeyDown(event)
+            fileContextMenuProps?.onKeyDown?.(event)
+          }}
         >
           <TextShimmer>{summaryText}</TextShimmer>
         </button>
-      ) : linkHref !== undefined ? (
+      ) : exitLabel === null && linkHref !== undefined ? (
         <a
           className={css.fileLink}
           href={linkHref}
+          {...urlContextMenuProps}
           target="_blank"
           rel="noopener noreferrer"
           onClick={stopLinkClick}
-          onKeyDown={summaryLinkKeyDown}
+          onKeyDown={(event) => {
+            summaryLinkKeyDown(event)
+            urlContextMenuProps?.onKeyDown?.(event)
+          }}
         >
           <TextShimmer>{summaryText}</TextShimmer>
         </a>
@@ -235,20 +310,25 @@ export const ToolRow = memo(function ToolRow({
         <span
           className={clsx(
             css.summary,
-            state === 'error' && css.errorSummary,
-            state === 'stopped' && css.stoppedSummary,
+            exitLabel === null && state === 'error' && css.errorSummary,
+            exitLabel === null && state === 'stopped' && css.stoppedSummary,
           )}
         >
           <TextShimmer>{summaryText}</TextShimmer>
         </span>
       )}
+      {exitLabel !== null && <ExitCodeBadge label={exitLabel} />}
       {suffix !== null && (
-        <TextShimmer className={clsx(css.summarySuffix, typeof suffix !== 'string' && css.diffStat)}>
-          {typeof suffix === 'string' ? suffix : <><span className={css.diffAdded}>{`+${suffix.added}`}</span>{' '}<span className={css.diffRemoved}>{`-${suffix.removed}`}</span></>}
+        <TextShimmer className={css.summarySuffix}>{suffix}</TextShimmer>
+      )}
+      {totals !== null && (
+        <TextShimmer className={clsx(css.summarySuffix, css.diffStat)}>
+          <span className={css.diffAdded}>{`+${totals.added}`}</span>{' '}<span className={css.diffRemoved}>{`-${totals.removed}`}</span>
         </TextShimmer>
       )}
     </>
-  ), [summaryLinkKeyDown, linkHref, openFile, state, suffix, summaryText])
+  ), [summaryLinkKeyDown, fileContextMenuProps, urlContextMenuProps, linkHref, openFile, fileTargets, openTarget,
+    fileTargetContextMenuProps, state, suffix, totals, summaryText, exitLabel])
   const expandedContent = useMemo(() => open ? (
     <div className={clsx(css.bodyWrap, detailsBody !== null && css.detailsBodyWrap)}>
       {askQuestionBody !== null
@@ -263,27 +343,50 @@ export const ToolRow = memo(function ToolRow({
             />
           )
           : diffBody !== null
-            ? <DiffBlock {...diffBody.card} labels={diffLabels} maxLines={CHAT_DIFF_MAX_LINES} className={css.diffBody} />
+            ? (
+              <>
+                <DiffBlock {...diffBody.card} labels={diffLabels} maxLines={CHAT_DIFF_MAX_LINES} className={css.diffBody} />
+                {state === 'error' && outputText !== null && (
+                  <div className={css.ioCard}>
+                    <div className={css.ioSection}>
+                      <span className={css.ioLabel}>{t('row.output')}</span>
+                      <span className={css.ioText} data-error>{outputText}</span>
+                    </div>
+                  </div>
+                )}
+              </>
+            )
             : readBody !== null
               ? <ReadBlock {...readBody} labels={readLabels} maxLines={CHAT_READ_MAX_LINES} className={css.readBody} />
               : imageBody !== null
                 ? (
-                  /* Label, gallery, then the result's OWN envelope text. The text
-                     comes from the image card model (which reads the result's text
-                     block), never from the row's flattened output: an image read's
-                     content is [text envelope, image block] and flattening
-                     JSON.stringifies the image block, printing the raw attachment
-                     object under the picture. It is not redundant either — the
-                     attachment slot can render nothing, and then this line is the
-                     only evidence an image was returned. */
+                  /* Gallery, then the full path and each attached image's size.
+                     These come from the image card model, never from the row's
+                     flattened output, which JSON.stringifies the image block. They
+                     stay visible when the attachment slot renders nothing. */
                   <div className={css.imageBody}>
-                    <div className={css.imageLabel}>{imageBody.label}</div>
                     {renderSlot !== undefined && loadImage !== undefined && renderSlot('tool.call.images', {
                       images: imageBody.images,
                       loadImage,
                       align: 'start',
                     })}
-                    <div className={css.imageMeta}>{imageBody.text}</div>
+                    <div className={css.imageMeta}>
+                      <div>{imageBody.path}</div>
+                      {imageBody.images.map(({ attachment }, index) => (
+                        <div key={index}>
+                          {attachment.originalDimensions === undefined
+                            ? t('row.imageSize', { width: attachment.width, height: attachment.height, bytes: attachment.bytes })
+                            : t('row.imageSizeDownscaled', {
+                              width: attachment.width,
+                              height: attachment.height,
+                              originalWidth: attachment.originalDimensions.width,
+                              originalHeight: attachment.originalDimensions.height,
+                              bytes: attachment.bytes,
+                            })}
+                        </div>
+                      ))}
+                    </div>
+                    {imageBody.extraText !== null && <div className={css.imageExtra}>{imageBody.extraText}</div>}
                   </div>
                 )
                 : searchBody !== null

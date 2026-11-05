@@ -3,26 +3,29 @@
 # After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write docs/subsystems/slots.md
 /web-client-slots:
-  en: bda026282132e290
-  zh: 3e3faf96c72420d6
+  en: 15c49af3ed8b57ff
+  zh: e7f9189de6f4334c
 /web-client-slots/declaration-and-lifecycle:
   en: f2d2c0d3b8f14ec7
   zh: 441ed13ff3f81d2a
 /web-client-slots/cardinality-and-scope:
-  en: 5b0ada069239576b
-  zh: 7e71ced7f17d78a6
+  en: 488f2f309af94398
+  zh: 7941265e4c545c21
+/web-client-slots/cardinality-and-scope/hoc-layers:
+  en: e6862954bd8874af
+  zh: 0244a2d7bb0befdf
 /web-client-slots/component-inputs:
-  en: 9cb70abb2e39b958
-  zh: cd4b6f1705d90e17
+  en: 278b2eee160be413
+  zh: d6e0fd1e9f4a4b27
 /web-client-slots/framework-provided-hooks:
-  en: 2fcfc55fbac80f72
-  zh: ea3016f394c56b07
+  en: c9f8d836214623ae
+  zh: 76dec55006396535
 /web-client-slots/developer-provided-injection:
-  en: 4fb5222bb2b064e7
-  zh: b961f792052b4ce5
-/web-client-slots/current-hierarchy:
-  en: 8a4cc4b8608ce0f6
-  zh: 21281dcf047503b2
+  en: 3481dfa6cd3097da
+  zh: acbd6f06a7da1752
+/web-client-slots/conversation-hierarchy:
+  en: e1d572c42e91d663
+  zh: 5a649dea2682be7f
 /web-client-slots/extension-rules:
-  en: b2cce357141883ee
-  zh: 278080a5fb941189
+  en: e5fdcd6fafe4d161
+  zh: 7fd0c4374705b372

@@ -2,19 +2,19 @@
 import { memo, useCallback, useEffect, useId, useRef, useState, type ComponentProps, type ReactNode } from 'react'
 import {
   IconAgentPresetOutlineRegular, IconApiOutlineRegular, IconBrowseOutlineRegular, IconChevronDownOutlineRegular,
-  IconChevronUpOutlineRegular, IconCodeOutlineRegular, IconEditOutlineRegular, IconGlobeOutlineRegular,
-  IconPlanOutlineRegular, IconQuestionOutlineRegular, IconSearchOutlineRegular, IconSparkleRegular,
+  IconChevronUpOutlineRegular, IconCodeOutlineRegular, IconContextInjectionOutlineRegular, IconEditOutlineRegular,
+  IconGlobeOutlineRegular, IconPlanOutlineRegular, IconQuestionOutlineRegular, IconSearchOutlineRegular, IconSparkleRegular,
   IconThinkOutlineRegular, TextShimmer,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { GroupKey, NodeReference } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { ProcessActivity } from '../contract/process-groups.ts'
+import type { ProcessActivity, RunningProcessActivity } from '../contract/process-groups.ts'
 import type { ChatStoreState } from '../contract/store.ts'
-import type { ChatViewSlotProps } from '../contract/slots.ts'
-import { storedTurnProcessEntry } from '../stores.ts'
+import type { ChatFlowSlotProps } from '../contract/slots.ts'
+import { turnProcessOpen } from '../stores.ts'
 import { ChatNodeSeat } from './ChatNodeSeat.tsx'
+import { hiddenOrCollapsing } from './flow-motion.ts'
 import { chatRenderKey } from './render-entry.ts'
 import { processTitle } from './step-process.ts'
-import { useSearchableHidden } from './searchable-hidden.ts'
 import { useDisclosure } from './use-disclosure.ts'
 import { useProcessScroll } from './use-process-scroll.ts'
 import css from './ChatGroupSeat.module.css'
@@ -22,14 +22,15 @@ import css from './ChatGroupSeat.module.css'
 type SeatProps = Omit<ComponentProps<typeof ChatNodeSeat>, 'nodeKey' | 'groupPart'>
 type ChatGroupSeatProps = SeatProps & {
   readonly groupKey: GroupKey
-  readonly useChatGroup: ChatViewSlotProps['useChatGroup']
+  readonly useChatGroup: ChatFlowSlotProps['useChatGroup']
+  readonly useGroupHeaderAction: ChatFlowSlotProps['useGroupHeaderAction']
 }
 const PROCESS_TITLE_MINIMUM_MS = 150
 
 type ProcessTitleActivity = ProcessActivity | 'thinking'
 
 interface LiveProcessTitle {
-  readonly activity: ProcessTitleActivity
+  readonly activity: RunningProcessActivity | 'thinking'
   readonly detail: string
   readonly preparing: boolean
 }
@@ -49,6 +50,7 @@ const PROCESS_ICONS: Record<ProcessTitleActivity, ReactNode> = {
   plan: <IconPlanOutlineRegular />,
   questions: <IconQuestionOutlineRegular />,
   tools: <IconSparkleRegular size={14} />,
+  context: <IconContextInjectionOutlineRegular size={14} />,
 }
 
 function sameLiveProcessTitle(left: LiveProcessTitle, right: LiveProcessTitle): boolean {
@@ -90,9 +92,9 @@ const GroupMembers = memo(function GroupMembers({ members, ...props }: SeatProps
 
 const ProcessGroupHeader = memo(function ProcessGroupHeader({ groupKey, useChatGroup, usePresentation, t, open, bodyId, toggle }: {
   readonly groupKey: GroupKey
-  readonly useChatGroup: ChatViewSlotProps['useChatGroup']
-  readonly usePresentation: ChatViewSlotProps['usePresentation']
-  readonly t: ChatViewSlotProps['t']
+  readonly useChatGroup: ChatFlowSlotProps['useChatGroup']
+  readonly usePresentation: ChatFlowSlotProps['usePresentation']
+  readonly t: ChatFlowSlotProps['t']
   readonly open: boolean
   readonly bodyId: string
   readonly toggle: () => void
@@ -128,38 +130,46 @@ const ProcessGroupHeader = memo(function ProcessGroupHeader({ groupKey, useChatG
 })
 
 /** Render a process group with local disclosure and the existing outer-Turn visibility. */
-export const ChatGroupSeat = memo(function ChatGroupSeat({ groupKey, useChatGroup, ...props }: ChatGroupSeatProps) {
+export const ChatGroupSeat = memo(function ChatGroupSeat({ groupKey, useChatGroup, useGroupHeaderAction, ...props }: ChatGroupSeatProps) {
   const members = useChatGroup(groupKey, group => group?.members)
   const turn = useChatGroup(groupKey, group => group?.data.turn)
   const closed = useChatGroup(groupKey, group => group?.data.closed)
   const foldCompleted = props.usePresentation(policy => policy.foldCompletedTurns)
   const { expanded: open, setExpanded: setOpen } = useDisclosure()
   const firstKey = members?.[0]?.key ?? ''
+  const bottom = props.useChatNodeBottom(firstKey)
+  const deferCollapse = bottom === true && props.deferCollapse
   const presentation = props.useChatNodeProcess(firstKey)
   const turnLocation = props.useChatNode(firstKey, (node) => {
     const location = node?.location
     return location?.kind === 'turn' || location?.kind === 'step' ? location.turn : undefined
   })
+  // Detailed keeps the latest completed Turn flat, like a running one, until the next input.
   const grouped = props.usePresentation(policy => policy.stepGrouping === 'collapsed'
-    || (policy.stepGrouping === 'history' && turnLocation?.status !== 'open'))
+    || (policy.stepGrouping === 'history' && turnLocation?.status !== 'open' && !deferCollapse))
   const reason = turnLocation?.end?.data.reason.kind
   const alwaysOpen = presentation?.turnClosed === false || presentation?.hasInterleavedInput === true
-    || reason === 'aborted' || reason === 'error'
+    || reason === 'aborted' || reason === 'interrupted' || reason === 'error'
   const spec = presentation?.spec
-  const selectStored = useCallback((state: Readonly<ChatStoreState>) => turn === undefined
-    ? undefined : storedTurnProcessEntry(state, turn), [turn])
-  const stored = props.useStore(selectStored)
+  const selectOpen = useCallback((state: Readonly<ChatStoreState>) => spec !== undefined
+    && turnProcessOpen(state, spec, deferCollapse), [spec, deferCollapse])
+  const storedOpen = props.useStore(selectOpen)
   const outerHidden = foldCompleted && presentation?.turnClosed === true && spec !== undefined
-    && !alwaysOpen && stored?.answerStep !== (spec.answerStep ?? 0)
+    && !alwaysOpen && !storedOpen
   const revealOuter = useCallback(() => {
     if (spec !== undefined && !alwaysOpen) props.actions.setTurnProcessOpen(spec.turn, spec.answerStep ?? 0, true)
   }, [props.actions, spec, alwaysOpen])
-  const rootRef = useSearchableHidden(outerHidden, revealOuter)
+  const rootRef = props.useGroupAction(outerHidden, revealOuter)
+  // The header appears when a flat latest Turn becomes historical; it grows on the fold clock while the
+  // body closes. A group whose whole Turn is folding never shows one in the frame it starts closing.
+  const headerRef = useRef<HTMLDivElement>(null)
+  const deferCompletedTurns = props.usePresentation(policy => policy.collapseTiming === 'next-input')
+  useGroupHeaderAction(headerRef, !grouped || (deferCompletedTurns && outerHidden))
   useEffect(() => {
-    if (outerHidden && rootRef.current?.hasAttribute('hidden')) setOpen(false)
+    if (outerHidden && rootRef.current !== null && hiddenOrCollapsing(rootRef.current)) setOpen(false)
   }, [outerHidden, rootRef, setOpen])
   const reveal = useCallback(() => { setOpen(true) }, [setOpen])
-  const bodyRef = useSearchableHidden(grouped && !open, reveal)
+  const bodyRef = props.useGroupAction(grouped && !open, reveal)
   const contentRef = useRef<HTMLDivElement>(null)
   const bodyId = useId()
   const { edges, events, initialize } = useProcessScroll(bodyRef, contentRef, open, grouped)
@@ -167,15 +177,22 @@ export const ChatGroupSeat = memo(function ChatGroupSeat({ groupKey, useChatGrou
     if (!open) initialize(closed === false ? 'bottom' : 'top')
     setOpen(!open)
   }, [closed, initialize, open, setOpen])
+  // With next-input timing the height cap applies only to a group the reader opened. A closing body keeps
+  // the cap it was last shown with, so the transition starts from what is on screen: a reader-opened group
+  // closes from its cap, and a flat latest Turn becoming historical closes from its flat height.
+  const shownCap = !grouped ? false : open ? true : undefined
+  const [closingCap, setClosingCap] = useState(shownCap ?? true)
+  if (shownCap !== undefined && shownCap !== closingCap) setClosingCap(shownCap)
   if (members === undefined) return null
-  const classes = [css.body, !grouped ? css.expandedBody : '',
-    grouped && edges.canScrollUp ? css.fadeTop : '', grouped && edges.canScrollDown ? css.fadeBottom : '']
+  const capped = grouped && (!deferCompletedTurns || (shownCap ?? closingCap))
+  const classes = [css.body, !capped ? css.expandedBody : '',
+    capped && edges.canScrollUp ? css.fadeTop : '', capped && edges.canScrollDown ? css.fadeBottom : '']
   return (
     <div ref={rootRef} className={css.root} data-chat-group-key={groupKey}
       data-chat-flow-key={groupKey} data-chat-anchor-key={`group:${groupKey}`} data-chat-turn={turn}
       data-chat-paging-anchor={grouped && !open || undefined}
       data-step-process data-group-expanded-mode={!grouped || undefined}>
-      <div hidden={!grouped}>
+      <div ref={headerRef}>
         <ProcessGroupHeader groupKey={groupKey} useChatGroup={useChatGroup}
           usePresentation={props.usePresentation} t={props.t} open={open} bodyId={bodyId} toggle={toggle} />
       </div>

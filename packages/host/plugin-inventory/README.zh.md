@@ -41,6 +41,8 @@ Loader 行与预设行可以携带可选的 `meta`，其中包含标题、描述
 
 该清单是供展示与诊断的快照：客户端可以渲染名单、标出失败条目，并通过比较快照检测变化。它不能启用、停用、添加或移除插件，也不携带历史——已经失败并被移除的 fiber 缺席。由于服务每次调用都读取 Loader，答案总是反映当前组合，而不是缓存视图。
 
+失败条目包含从 Cordis fiber 读取的当前启动诊断。恢复后移除该诊断；清单查询不等待仍在加载的条目，也不另存错误缓存。
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -65,7 +67,6 @@ Fiber 状态映射到公共阶段词汇，其中 `disposed` 折叠为 `null`—�
 |---|---|
 | [`src/index.ts`](src/index.ts) | `PluginInventoryGateway`：`pluginInventory` Remote 服务与 Loader 投影 |
 | [`src/types.ts`](src/types.ts) | 公共 payload 类型：`PluginInventoryEntry`、`PluginInventorySnapshot`、`PluginFiberPhase` |
-| — | 不发布运行时不变式配套项；每个快照都投影 Loader 持有的状态。 |
 
 Typert 生成由 `./typert` 与 `./remote` 导出的 Host 和 Client Remote 产物。
 

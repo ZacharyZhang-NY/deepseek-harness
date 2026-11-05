@@ -1,7 +1,7 @@
 /** Root/subcall Tool composition with one keyed atomic dispatch path. */
-import { memo, useMemo, type ReactNode } from 'react'
+import { memo, useCallback, useMemo, type ReactNode } from 'react'
 import type { ToolCallBlock } from '@deepseek-ai/dsh-client-ui-chat/client'
-import type { ToolCallHookContext, ToolCallOwnerProps, ToolCallPhaseProps, ToolTreeProps } from '../contract/slots.ts'
+import type { ToolCallOwnerProps, ToolCallPhaseProps, ToolTreeProps } from '../contract/slots.ts'
 import { toolRowModel } from './models/tool-call-model.ts'
 import { GenericToolCard } from './toolviews/GenericToolCard.tsx'
 import css from './ToolCallTree.module.css'
@@ -18,19 +18,15 @@ function callName(call: ToolCallPhaseProps): string {
 
 /** One atomic call dispatched through the Tool-owned keyed slot. */
 const ToolCall = memo(function ToolCall({
-  renderSlot, callId, toolName, call, assistant, openFile, cwd, home, inspectCall, loadImage, useDisclosure, t, children,
-}: Pick<ToolTreeProps, 'renderSlot' | 'openFile' | 'cwd' | 'inspectCall' | 'loadImage' | 'useDisclosure' | 't'> & {
+  renderSlot, callId, toolName, call, openFile, renderFallback, cwd, home, inspectCall, loadImage, useDisclosure, children,
+}: Pick<ToolTreeProps, 'renderSlot' | 'openFile' | 'cwd' | 'inspectCall' | 'loadImage' | 'useDisclosure'> & {
+  renderFallback: (owner: ToolCallOwnerProps) => ReactNode
   callId: string
   toolName: string
   call: ToolCallPhaseProps
-  assistant: ToolCallHookContext['assistant']
   home?: string | undefined
   children?: ReactNode
 }) {
-  const preparing = call.phase === 'preparing'
-  const hookContext = useMemo<ToolCallHookContext>(() => ({
-    callId, assistant: preparing ? assistant : undefined,
-  }), [assistant, callId, preparing])
   const owner: ToolCallOwnerProps = useMemo(() => ({
     callId,
     toolName,
@@ -53,11 +49,10 @@ const ToolCall = memo(function ToolCall({
       data-chat-call-id={callId}
     >
       {autoReviewDenied
-        ? <GenericToolCard {...owner} t={t} />
+        ? renderFallback(owner)
         : renderSlot('tool.call.toolview', owner, {
           entryKey: toolName,
-          hookContext,
-          fallback: <GenericToolCard {...owner} t={t} />,
+          fallback: renderFallback(owner),
         })}
       {children}
     </div>
@@ -65,10 +60,10 @@ const ToolCall = memo(function ToolCall({
 })
 
 const ToolCallBranch = memo(function ToolCallBranch({
-  renderSlot, block, assistant, cwd, home, openFile, inspectCall, loadImage, useDisclosure, t,
-}: Pick<ToolTreeProps, 'renderSlot' | 'cwd' | 'openFile' | 'inspectCall' | 'loadImage' | 'useDisclosure' | 't'> & {
+  renderSlot, block, cwd, home, openFile, renderFallback, inspectCall, loadImage, useDisclosure,
+}: Pick<ToolTreeProps, 'renderSlot' | 'cwd' | 'openFile' | 'inspectCall' | 'loadImage' | 'useDisclosure'> & {
+  renderFallback: (owner: ToolCallOwnerProps) => ReactNode
   block: ToolCallBlock
-  assistant: ToolCallHookContext['assistant']
   home?: string | undefined
 }) {
   const call = useMemo(() => toolCallPhase(block), [block])
@@ -78,14 +73,13 @@ const ToolCallBranch = memo(function ToolCallBranch({
       callId={call.block.callId}
       toolName={callName(call)}
       call={call}
-      assistant={assistant}
       openFile={openFile}
+      renderFallback={renderFallback}
       cwd={cwd}
       home={home}
       inspectCall={inspectCall}
       useDisclosure={useDisclosure}
       loadImage={loadImage}
-      t={t}
     >
       {call.phase !== 'preparing' && call.block.subCalls.length > 0 ? (
         <div className={css.subCalls} data-subcalls>
@@ -94,14 +88,13 @@ const ToolCallBranch = memo(function ToolCallBranch({
               key={child.callId}
               renderSlot={renderSlot}
               block={child}
-              assistant={assistant}
               cwd={cwd}
               home={home}
               openFile={openFile}
+              renderFallback={renderFallback}
               inspectCall={inspectCall}
               useDisclosure={useDisclosure}
               loadImage={loadImage}
-              t={t}
             />
           ))}
         </div>
@@ -117,22 +110,26 @@ const ToolCallBranch = memo(function ToolCallBranch({
  * @returns the Tool call tree.
  */
 export function ToolCallTree({
-  renderSlot, node, cwd, openFile, inspectCall, loadImage, useDisclosure, useHostInfo, t,
+  renderSlot, node, cwd, openFile, inspectCall, loadImage, useDisclosure, useHostInfo, t, useContextMenu, sessionId, resolveFilePath,
 }: ToolTreeProps) {
+  const { getTriggerProps } = useContextMenu()
+  const getFileTriggerProps = useCallback((path: string) => getTriggerProps(() => ({
+    kind: 'file', value: { sessionId, path: resolveFilePath(path) },
+  })), [getTriggerProps, sessionId, resolveFilePath])
+  const renderFallback = useCallback((owner: ToolCallOwnerProps) =>
+    <GenericToolCard {...owner} t={t} getFileTriggerProps={getFileTriggerProps} />, [t, getFileTriggerProps])
   const home = useHostInfo(info => info.home)
-  const assistant = node.location.kind === 'step' ? node.location.step.data.source('assistant-step') : undefined
   return (
     <ToolCallBranch
       renderSlot={renderSlot}
       block={node.data.root}
-      assistant={assistant}
       cwd={cwd}
       home={home}
       openFile={openFile}
+      renderFallback={renderFallback}
       inspectCall={inspectCall}
       useDisclosure={useDisclosure}
       loadImage={loadImage}
-      t={t}
     />
   )
 }

@@ -1,4 +1,5 @@
 /** Account route cancellation uses the real loop, registry, and tool lifecycle. */
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterEach, expect, it, vi } from 'vitest'
 import { installAccountTaskCancellation, type DeepSeekAccount } from '@deepseek-ai/dsh-deepseek-account'
 import { Context } from '@deepseek-ai/cordis'
@@ -8,7 +9,8 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import * as DeepSeek from '@deepseek-ai/dsh-llm-deepseek-api-key'
 import * as AccountProvider from '@deepseek-ai/dsh-llm-deepseek-account'
 import { assemble } from './assemble.ts'
@@ -17,14 +19,23 @@ const contexts: Context[] = []
 afterEach(async () => {
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
 })
+
+/** Fail the account listing request fast, so the route serves its bundled catalog and fetch mocks see only Messages traffic. */
+function listingRequest(input: string | URL | Request): Response | undefined {
+  const url = new URL(input instanceof Request ? input.url : input)
+  return url.pathname === '/models' ? new Response(null, { status: 404 }) : undefined
+}
 
 async function harness() {
   const ctx = new Context()
   contexts.push(ctx)
   installAccountTaskCancellation(ctx)
-  for (const plugin of [LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, AgentRegistry]) {
+  for (const plugin of [
+    LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, NativeToolExecutor, AgentRegistry,
+  ]) {
     await ctx.plugin(plugin)
   }
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -88,7 +99,7 @@ it.each(['deepseek-account', 'deepseek-official'])('cancels only the active acco
     ? { kind: 'hook', reason: 'deepseek-account/signed-out' } : { kind: 'user' } } })
 })
 
-it.each(['tool', 'retry'])('replaces the active provider only after the next request binds: %s', async (transition) => {
+it.each(['tool', 'retry'])('keeps the active provider until a later step binds a new selection: %s', async (transition) => {
   const ctx = await harness()
   const preparing = Promise.withResolvers<undefined>()
   const proceed = Promise.withResolvers<undefined>()
@@ -99,11 +110,18 @@ it.each(['tool', 'retry'])('replaces the active provider only after the next req
     if (++requests === 1) return config
     preparing.resolve(undefined)
     await proceed.promise
-    return { ...config, provider: 'deepseek-official' }
+    return config
   })
-  ctx.on('agent/request-error', async (_event, next) => { await next(); return { kind: 'retry' } })
+  const selectOfficial = (agent: Agent) => {
+    agent.model.select({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  }
+  ctx.on('agent/request-error', async ({ agent }, next) => {
+    await next()
+    selectOfficial(agent)
+    return { kind: 'retry' }
+  })
   ctx.on('llm/stream', async function* (request) {
-    if (request.provider === 'deepseek-account') {
+    if (requests === 1) {
       if (transition === 'retry') {
         yield { type: 'finish', reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'retry fixture' } } }
         return
@@ -115,22 +133,29 @@ it.each(['tool', 'retry'])('replaces the active provider only after the next req
     }
     const signal = request.signal!
     streaming.resolve(signal)
-    await new Promise<void>((resolve) => { signal.addEventListener('abort', () => { resolve() }, { once: true }) })
+    if (!signal.aborted) await new Promise<void>((resolve) => { signal.addEventListener('abort', () => { resolve() }, { once: true }) })
     signal.throwIfAborted()
   })
-  ctx.tools.register(defineContentToolFixture({ name: 'continue', description: '', parameters: {}, execute: async () => [{ type: 'text', text: 'done' }] }))
+  ctx.tools.register(defineContentToolFixture({ name: 'continue', description: '', parameters: {}, execute: async () => {
+    selectOfficial(agent)
+    return [{ type: 'text', text: 'done' }]
+  } }))
   const agent = await ctx.agentLoop.create(SessionId('switch-provider'), { provider: 'deepseek-account', model: 'deepseek-v4-flash' })
   expect(agent.session.requestContext()?.provider).toBeUndefined()
-  send(agent)
-  await preparing.promise
-  expect(agent.session.requestContext()?.provider).toBe('deepseek-account')
-  proceed.resolve(undefined)
-  const signal = await streaming.promise
-  expect(agent.session.requestContext()?.provider).toBe('deepseek-official')
-  ctx.emit('deepseek-account/signed-out')
-  expect(signal.aborted).toBe(false)
-  agent.cancel({ kind: 'user' })
-  await agent.whenIdle()
+  try {
+    send(agent)
+    await preparing.promise
+    expect(agent.session.requestContext()?.provider).toBe('deepseek-account')
+    proceed.resolve(undefined)
+    const signal = await streaming.promise
+    expect(agent.session.requestContext()?.provider).toBe(transition === 'tool' ? 'deepseek-official' : 'deepseek-account')
+    ctx.emit('deepseek-account/signed-out')
+    expect(signal.aborted).toBe(transition === 'retry')
+  } finally {
+    proceed.resolve(undefined)
+    agent.cancel({ kind: 'user' })
+    await agent.whenIdle()
+  }
   expect(agent.status).toBe('idle')
 })
 
@@ -176,7 +201,9 @@ it('propagates account sign-out to the HTTP request signal', async () => {
   const ctx = await harness()
   ctx.provide('deepseekAccount', { resolveToken: async (_url: string) => 'fixture-account-token' } as DeepSeekAccount)
   const started = Promise.withResolvers<AbortSignal>()
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    const listed = listingRequest(url)
+    if (listed !== undefined) return listed
     const signal = init!.signal!
     expect(new Headers(init!.headers).get('x-dsh-auth-token')).toBe('fixture-account-token')
     started.resolve(signal)
@@ -207,7 +234,7 @@ it('cancels an account child without stopping its API-key parent', async () => {
     signal.throwIfAborted()
   })
   const parent = await ctx.agentLoop.create(SessionId('parent'), { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
-  const childHandle = await ctx.agents.create({ sessionId: SessionId('child'), parentAgent: parent,
+  const childHandle = await ctx.agents.create({ sessionId: SessionId('child'),
     agentOptions: { provider: 'deepseek-account', model: 'deepseek-v4-flash' } })
   send(parent)
   send(childHandle.agent)
@@ -220,16 +247,18 @@ it('cancels an account child without stopping its API-key parent', async () => {
   await parent.whenIdle()
 })
 
-it('hides signed-out account models while retaining the official catalog without an API key', async () => {
+it('lists each DeepSeek route only when its own credential is present', async () => {
+  vi.stubEnv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
   vi.stubEnv('DEEPSEEK_API_KEY', '')
+  vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => Promise.resolve(listingRequest(input) ?? new Response(null, { status: 500 }))))
   const ctx = await harness()
   let token: string | undefined
   ctx.provide('deepseekAccount', { resolveToken: async (url: string) => new URL(url).origin === 'https://api.deepseek.com' ? token : undefined } as DeepSeekAccount)
   expect(await ctx.llm.listModels('deepseek-account')).toEqual([])
-  expect(await ctx.llm.listModels('deepseek-official')).not.toHaveLength(0)
+  expect(await ctx.llm.listModels('deepseek-official')).toEqual([])
   token = 'fixture-account-token'
   expect(await ctx.llm.listModels('deepseek-account')).not.toHaveLength(0)
-  expect(await ctx.llm.listModels('deepseek-official')).not.toHaveLength(0)
+  expect(await ctx.llm.listModels('deepseek-official')).toEqual([])
   vi.stubEnv('DEEPSEEK_API_KEY', 'fixture-key')
   expect(await ctx.llm.listModels('deepseek-official')).not.toHaveLength(0)
   token = undefined
@@ -254,13 +283,14 @@ it('ignores idle account history but uses the last bound route during a new turn
   const cancel = vi.spyOn(agent, 'cancel')
   ctx.emit('deepseek-account/signed-out')
   expect(cancel).not.toHaveBeenCalled()
+  agent.model.select({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
   const preparing = Promise.withResolvers<undefined>()
   const proceed = Promise.withResolvers<undefined>()
   ctx.on('agent/request', async (_event, next) => {
     const config = await next()
     preparing.resolve(undefined)
     await proceed.promise
-    return { ...config, provider: 'deepseek-official' }
+    return config
   })
   try {
     send(agent)

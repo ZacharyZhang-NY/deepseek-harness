@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import type { Browser, Locator, Page } from 'playwright'
 import { chromium } from 'playwright'
-import { OPTIONAL_BUNDLES } from '@deepseek-ai/dsh-app-boot'
+import { HIDDEN_BUNDLES } from '@deepseek-ai/dsh-official-bundles'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { join } from 'node:path'
 import {
@@ -24,6 +24,7 @@ const ROW_EXPECTED = join(SNAPSHOT_DIR, 'row.expected.md')
 const BUNDLE_EXPECTED = join(SNAPSHOT_DIR, 'bundle.expected.md')
 const FIXTURE_PLUGINS = fileURLToPath(new URL('./fixtures/plugins', import.meta.url))
 const MODE = webSnapshotMode()
+const UNUSED_KEY_ENV = 'DSH_PLUGIN_CONFIG_E2E_UNUSED_KEY'
 
 describe('web e2e: plugin configuration pages', () => {
   let scaffold: WebScaffold
@@ -34,8 +35,11 @@ describe('web e2e: plugin configuration pages', () => {
   beforeAll(async () => {
     // The live-client fixture is a bundle with a browser half; switched on
     // below, that half registers its row's configuration into the page.
+    // Legacy Messages search names an unset credential so the goldens show the
+    // unconfigured key whatever keys the host environment carries.
     scaffold = await launchWebScaffold({
       extraOverlayPath: fileURLToPath(new URL('./pin-browse-picker.overlay.yml', import.meta.url)),
+      deepSeekSearch: { apiKeyEnv: UNUSED_KEY_ENV },
       profile: { packages: [{ dir: join(FIXTURE_PLUGINS, 'fixture-live-client') }] },
     })
     browser = await chromium.launch()
@@ -68,7 +72,7 @@ describe('web e2e: plugin configuration pages', () => {
     while (await panel.getByRole('button', { name: /^返回/ }).count() > 0) {
       await panel.getByRole('button', { name: /^返回/ }).first().click()
     }
-    await panel.getByRole('heading', { name: '官方', exact: true }).waitFor({ timeout: 20_000 })
+    await panel.getByRole('heading', { name: '内置插件配置', exact: true }).waitFor({ timeout: 20_000 })
     return panel
   }
 
@@ -83,28 +87,165 @@ describe('web e2e: plugin configuration pages', () => {
     return readFile(join(scaffold.harnessHome, 'profiles', 'scaffold', 'cordis.patch.yml'), 'utf8').catch(() => '')
   }
 
-  it('lists one official page per exposed host-plane namespace after the official bundles', async () => {
+  it('keeps configuration pages first and opens the full experimental plugin list separately', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-plugin-config-cards'))
     const panel = await openPlugins()
 
     // Every page the shipped web composition exposes: the shell executor, the
-    // agent loop, subagent selection, and the DeepSeek search provider, after
-    // the official bundles the installation ships switched off.
-    await panel.getByRole('button', { name: '查看 网页搜索', exact: true }).waitFor({ timeout: 20_000 })
-    const official = panel.locator('[data-plugin-group="official"]')
-    expect(await official.locator('[data-plugin-package]').count()).toBe(OPTIONAL_BUNDLES.length)
-    expect(await official.locator('[data-plugin-item]').count()).toBe(4)
-    for (const title of ['终端', 'Agent 循环', '子智能体', '网页搜索']) {
-      expect(await official.getByRole('button', { name: `查看 ${title}`, exact: true }).count()).toBe(1)
+    // agent loop, subagent selection, and the DeepSeek search provider.
+    await panel.getByRole('button', { name: '查看 网页搜索与获取', exact: true }).waitFor({ timeout: 20_000 })
+    const basic = panel.locator('[data-plugin-group="basic"]')
+    expect(await basic.locator('[data-plugin-item]').count()).toBe(4)
+    expect(await basic.locator(':scope > ul > li').evaluateAll(cards => cards.map(card => card.getAttribute('data-plugin-item'))))
+      .toEqual(['subagent', 'web-search', 'agent-loop', 'shell'])
+    for (const title of ['子智能体', '网页搜索与获取', 'Agent 循环', '终端']) {
+      expect(await basic.getByRole('button', { name: `查看 ${title}`, exact: true }).count()).toBe(1)
     }
     // A card carries the one-liner; the fields wait for the page.
-    expect(await official.getByText('限制每条命令最多能跑多久、最多输出多少内容。', { exact: true }).count()).toBe(1)
+    expect(await basic.getByText('限制每条命令最多能跑多久、最多输出多少内容。', { exact: true }).count()).toBe(1)
     expect(await panel.getByLabel('命令超时（毫秒）').count()).toBe(0)
+
+    const extensions = panel.locator('[data-plugin-group="extensions"]')
+    const more = panel.getByRole('button', { name: '更多', exact: true })
+    expect(await extensions.getByRole('heading', { name: '实验性插件', exact: true }).count()).toBe(1)
+    expect(await extensions.getByRole('button', { name: '更多', exact: true }).textContent()).toBe('更多')
+    expect(await extensions.getByRole('list').isVisible()).toBe(true)
+    expect(await panel.locator('[data-plugin-group="more"]').count()).toBe(0)
+    await more.focus()
+    await page.keyboard.press('Enter')
+    await panel.getByRole('heading', { name: '实验性插件', exact: true, level: 1 }).waitFor()
+    // The More list omits the shipped bundles whose own rows do not run (the visibility rule lives in
+    // ui-plugin-manager), so it holds fewer cards than the installed optional-bundle list.
+    const bundles = await scaffold.ctx.pluginManager.listBundles()
+    expect(await panel.locator('[data-plugin-group="more"] [data-plugin-package]').count())
+      .toBe(bundles.filter(bundle => !HIDDEN_BUNDLES.has(bundle.name)
+        && bundle.name !== '@deepseek-ai/dsh-experimental-liveshare'
+        && bundle.official && (bundle.listedByDefault !== false || bundle.enabled || bundle.installed)).length)
+    expect(await basic.count()).toBe(0)
+    expect(await extensions.count()).toBe(0)
+    expect(await panel.locator('[data-plugin-group="bundles"]').count()).toBe(0)
+    await panel.getByRole('button', { name: '查看 开发者工具', exact: true }).click()
+    await panel.locator('[data-plugin-detail]').waitFor()
+    await panel.getByRole('button', { name: '返回 实验性插件', exact: true }).click()
+    await panel.getByRole('heading', { name: '实验性插件', exact: true, level: 1 }).waitFor()
+    await panel.getByRole('button', { name: '返回插件', exact: true }).focus()
+    await page.keyboard.press('Space')
+    expect(await extensions.getByRole('list').isVisible()).toBe(true)
+    expect(await panel.locator('[data-plugin-group="more"]').count()).toBe(0)
+    await more.click()
+    await page.reload({ waitUntil: 'load' })
+    await openPlugins()
+    expect(await extensions.getByRole('list').isVisible()).toBe(true)
+    expect(await panel.locator('[data-plugin-group="more"]').count()).toBe(0)
 
     const snapshot = await captureStableAria(page, '[data-plugin-panel]', scaffold.workspaceCwd)
     await compareOrRefreshGolden(OFFICIAL_EXPECTED, snapshot, MODE)
     expect(tripwire.pageErrors).toEqual([])
   }, 60_000)
+
+  it('selects search and fetch providers independently and keeps each provider’s settings', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-search-api-settings'))
+    const panel = await openPlugins()
+    await openPage(panel, '网页搜索与获取')
+    // A menu's accessible name is its label followed by the selected entry, so the menus are found by id.
+    const searchMenu = panel.locator('#plugin-config-web-search-provider')
+    const fetchMenu = panel.locator('#plugin-config-web-fetch-provider')
+    const searchSection = panel.getByRole('region', { name: '网页搜索提供方', exact: true })
+    const fetchSection = panel.getByRole('region', { name: '网页获取提供方', exact: true })
+    const count = panel.getByLabel('每次搜索结果数', { exact: true })
+    const save = panel.getByRole('button', { name: '保存', exact: true })
+    /** Pick one entry from a menu. */
+    async function choose(menu: Locator, label: string): Promise<void> {
+      await menu.click()
+      await page.getByRole('menuitem', { name: label, exact: true }).click()
+    }
+    /** Open a menu and read its entries in order, then close it. */
+    async function entries(menu: Locator): Promise<string[]> {
+      await menu.click()
+      const items = await page.getByRole('menuitem').allTextContents()
+      await page.keyboard.press('Escape')
+      await expect.poll(() => page.getByRole('menuitem').count()).toBe(0)
+      return items
+    }
+    // The shipped composition selects the DeepSeek Search API and local fetch, and the page writes nothing on mount.
+    expect(await searchMenu.textContent()).toBe('DeepSeek Search API')
+    expect(await fetchMenu.textContent()).toBe('本机直接获取')
+    expect(await panel.getByRole('button', { name: '网页搜索提供方 DeepSeek Search API', exact: true }).count()).toBe(1)
+    expect(await panel.getByRole('button', { name: '网页获取提供方 本机直接获取', exact: true }).count()).toBe(1)
+    expect(await entries(searchMenu)).toEqual(['DeepSeek Search API', 'DeepSeek（旧版）'])
+    expect(await entries(fetchMenu)).toEqual(['本机直接获取', 'DeepSeek Fetch API'])
+    expect(await settingsDocument()).not.toContain('searchProvider:')
+    // The page fixes the menu order itself; the Loader imports plugins concurrently, so the
+    // Host's registration order is not the YAML row order and only its membership is checked here.
+    const hostWeb = scaffold.ctx.get('web') as { listProviders(): Record<'search' | 'fetch', { id: string }[]> } | undefined
+    expect(hostWeb?.listProviders().search.map(provider => provider.id).sort()).toEqual(['deepseek-official', 'deepseek-search-api'])
+    expect(await panel.getByRole('link', { name: '网页搜索与获取指南', exact: true }).getAttribute('href'))
+      .toBe('https://api-docs.deepseek.com/zh-cn/guides/search')
+    // Each section shows the description its selected provider registered with the Host, in the active language.
+    expect(await searchSection.getByText('直接请求搜索接口返回标题、URL 与摘要，无需额外调用模型。使用当前会话的 DeepSeek 账号或 DeepSeek API Key，可能产生计费', { exact: true }).count()).toBe(1)
+    expect(await fetchSection.getByText('本机直接请求，免 API Key 与计费，可访问内网和本机。仅解码 HTML、JSON 等文本，不执行 JavaScript、不带登录态，不支持 PDF；也可以试试 DeepSeek Fetch API', { exact: true }).count()).toBe(1)
+    // The Fetch API suggestion is text, not an action.
+    expect(await fetchSection.getByRole('button').count()).toBe(1)
+    expect(await save.isDisabled()).toBe(true)
+
+    // The Search panel holds only the result count.
+    expect(await searchSection.getByRole('textbox').count()).toBe(1)
+    expect(await count.inputValue()).toBe('10')
+    await count.fill('51')
+    await panel.getByText('请填 1–50 的整数；留空表示使用默认值。', { exact: true }).waitFor()
+    expect(await save.isDisabled()).toBe(true)
+    for (const menu of [searchMenu, fetchMenu]) expect(await menu.isDisabled()).toBe(true)
+    await count.fill('10')
+    expect(await save.isDisabled()).toBe(true)
+
+    // The Fetch API takes no settings here, so its section shows no panel.
+    await choose(fetchMenu, 'DeepSeek Fetch API')
+    expect(await fetchSection.getByText('由 DeepSeek 服务端抓取公网页面并返回 Markdown。使用当前会话的 DeepSeek 账号或 DeepSeek API Key，可能产生计费，且无法访问内网和本机', { exact: true }).count()).toBe(1)
+    expect(await fetchSection.getByRole('textbox').count()).toBe(0)
+    expect(await fetchSection.getByRole('button').count()).toBe(1)
+    await save.click()
+    await expect.poll(() => save.isDisabled()).toBe(true)
+    await expect.poll(settingsDocument).toContain('fetchProvider: deepseek-fetch-api')
+
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    await openPlugins()
+    await openPage(panel, '网页搜索与获取')
+    expect(await searchMenu.textContent()).toBe('DeepSeek Search API')
+    expect(await fetchMenu.textContent()).toBe('DeepSeek Fetch API')
+    const snapshot = await captureStableAria(page, '[data-plugin-panel]', scaffold.workspaceCwd)
+    await compareOrRefreshGolden(join(SNAPSHOT_DIR, 'web-search.expected.md'), snapshot, MODE)
+
+    await choose(fetchMenu, '本机直接获取')
+    await save.click()
+    await expect.poll(() => save.isDisabled()).toBe(true)
+    await expect.poll(settingsDocument).not.toContain('fetchProvider: deepseek-fetch-api')
+
+    await choose(searchMenu, 'DeepSeek（旧版）')
+    const messagesEndpoint = panel.locator('#plugin-config-web-search-endpoint')
+    expect(await panel.getByLabel('单次请求最多搜索次数', { exact: true }).inputValue()).toBe('5')
+    await messagesEndpoint.fill('https://messages.test/anthropic/v1')
+    await save.click()
+    await expect.poll(() => save.isDisabled()).toBe(true)
+    await expect.poll(settingsDocument).toContain('searchProvider: deepseek-official')
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    await openPlugins()
+    await openPage(panel, '网页搜索与获取')
+    expect(await searchMenu.textContent()).toBe('DeepSeek（旧版）')
+    expect(await messagesEndpoint.inputValue()).toBe('https://messages.test/anthropic/v1')
+    expect(await entries(searchMenu)).toEqual(['DeepSeek Search API', 'DeepSeek（旧版）'])
+    expect(await save.isDisabled()).toBe(true)
+    expect(await settingsDocument()).toContain('searchProvider: deepseek-official')
+    await choose(searchMenu, 'DeepSeek Search API')
+    await count.fill('20')
+    await save.click()
+    await expect.poll(() => save.isDisabled()).toBe(true)
+    await expect.poll(settingsDocument).not.toContain('searchProvider:')
+    expect(await settingsDocument()).toContain('count: 20')
+    expect(await settingsDocument()).not.toMatch(/ApiKeyEnv:|searchBaseURL:|fetchBaseURL:/)
+    expect(tripwire.pageErrors).toEqual([])
+  })
 
   it('saves subagent limits and resets them to the deployment defaults', async () => {
     const panel = await openPlugins()
@@ -136,7 +277,7 @@ describe('web e2e: plugin configuration pages', () => {
     await openPage(panel, '子智能体')
     expect(await depth.inputValue()).toBe('1')
     expect(await capacity.inputValue()).toBe('8')
-    await panel.getByRole('button', { name: '返回插件列表', exact: true }).click()
+    await panel.getByRole('button', { name: '返回插件', exact: true }).click()
   })
 
   it('opens field explanations with the keyboard and retains unsaved edits', async () => {
@@ -160,7 +301,7 @@ describe('web e2e: plugin configuration pages', () => {
     await panel.getByRole('button', { name: '子智能体并行数量上限说明', exact: true }).click()
     const capacityRules = panel.getByRole('region', { name: '子智能体并行数量上限说明', exact: true })
     expect(await capacityRules.getByText('同一主 Agent 下，所有递归层级同时存活的子智能体总数，主 Agent 不计入。达到上限时，新的启动请求会被拒绝。', { exact: true }).count()).toBe(1)
-    await panel.getByRole('button', { name: '返回插件列表', exact: true }).click()
+    await panel.getByRole('button', { name: '返回插件', exact: true }).click()
     await openPage(panel, '子智能体')
     expect(await depth.inputValue()).toBe('1')
   })
@@ -241,8 +382,8 @@ describe('web e2e: plugin configuration pages', () => {
     await timeout.waitFor({ timeout: 10_000 })
 
     await timeout.fill('7000')
-    await panel.getByRole('button', { name: '返回插件列表' }).click()
-    await panel.getByRole('heading', { name: '官方', exact: true }).waitFor({ timeout: 10_000 })
+    await panel.getByRole('button', { name: '返回插件' }).click()
+    await panel.getByRole('heading', { name: '内置插件配置', exact: true }).waitFor({ timeout: 10_000 })
     await openPage(panel, '终端')
 
     await expect.poll(() => panel.getByLabel('命令超时（毫秒）').inputValue(), { timeout: 5_000 }).toBe('12000')
@@ -317,7 +458,9 @@ describe('web e2e: plugin configuration pages', () => {
     expect(await bundlePage.getByRole('button', { name: '夹具操作' }).count()).toBe(1)
     expect(await bundlePage.locator('[data-live-badge="bundle"]').textContent()).toBe('夹具标签')
     expect(await bundlePage.getByRole('region', { name: '夹具区块' }).getByText('来自夹具的区块内容').count()).toBe(1)
-    const bundleSnapshot = await captureStableAria(page, '[data-plugin-panel]', scaffold.workspaceCwd)
+    const bundleSnapshot = await captureStableAria(page, '[data-plugin-panel]', scaffold.workspaceCwd, {
+      replacements: [[FIXTURE_PLUGINS, '{{fixtures}}']],
+    })
     await compareOrRefreshGolden(BUNDLE_EXPECTED, bundleSnapshot, MODE)
     await configure.click()
 
@@ -340,7 +483,7 @@ describe('web e2e: plugin configuration pages', () => {
     await bundlePage.waitFor({ timeout: 10_000 })
 
     // An official plugin's page is another subject; the fixture's entries render nothing for it.
-    await panel.getByRole('button', { name: '返回插件列表' }).click()
+    await panel.getByRole('button', { name: '返回插件' }).click()
     await openPage(panel, '终端')
     const itemPage = panel.locator('[data-plugin-item-detail]')
     expect(await itemPage.locator('[data-live-action], [data-live-badge], [data-live-section]').count()).toBe(0)
@@ -349,7 +492,7 @@ describe('web e2e: plugin configuration pages', () => {
 
   it.skipIf(MODE === 'record')('keeps the fixture inventory closed', async () => {
     expect(tripwire.warnings).toEqual([])
-    await assertFixtureInventory(SNAPSHOT_DIR, ['bundle.expected.md', 'official.expected.md', 'row.expected.md', 'subagent.expected.md'])
+    await assertFixtureInventory(SNAPSHOT_DIR, ['bundle.expected.md', 'official.expected.md', 'row.expected.md', 'subagent.expected.md', 'web-search.expected.md'])
   })
 
 

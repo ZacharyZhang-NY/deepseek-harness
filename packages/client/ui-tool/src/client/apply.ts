@@ -6,8 +6,8 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+import { toolFileInject } from './tool/file-menu.ts'
 import { ToolCallTree } from './tool/ToolCallTree.tsx'
-import { bindToolCallArgumentsPartial } from './tool/tool-call-arguments-partial.ts'
 import { CONVERSATION_NS as NS } from './locale.ts'
 import { askQuestionToolview } from './tool/toolviews/ask-question-row.tsx'
 import { bashToolviewSample } from './tool/toolviews/bash-sample.tsx'
@@ -19,8 +19,8 @@ import { detailsToolview } from './tool/toolviews/details-row.tsx'
 import { todoToolview } from './tool/toolviews/todo-row.tsx'
 import { webToolview } from './tool/toolviews/web-row.tsx'
 
-/** Required services: the slot registry and the Remote face carrying the Host home used for POSIX `~`. */
-export const inject = ['slots', 'remote']
+/** Required services: Slots, live Session paths, and the Remote face carrying the Host home used for POSIX `~`. */
+export const inject = ['slots', 'remote', 'sessions']
 
 /**
  * Mount the whole-Tool renderers and built-in atomic Tool registrations.
@@ -31,16 +31,14 @@ export function apply(ctx: ClientContext): void {
     getSnapshot: () => ctx.remote.$host,
     subscribe: listener => ctx.on('connection/reset', listener),
   }
-  const toolInject = () => ({ hooks: { hostInfo } })
+  const fileInject = toolFileInject(ctx)
+  const toolInject = (sessionId: Parameters<typeof fileInject>[0]) => ({ ...fileInject(sessionId), hooks: { hostInfo } })
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
     name: 'conversation.chat.node',
     key: 'tool-call',
     locale: NS,
     children: {
-      'tool.call.toolview': {
-        kind: 'keyed', scope: 'session',
-        inject: { hooks: { toolCallArgumentsPartial: bindToolCallArgumentsPartial } },
-      },
+      'tool.call.toolview': { kind: 'keyed', scope: 'session' },
     },
     inject: toolInject,
   }, ToolCallTree))

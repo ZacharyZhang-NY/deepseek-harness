@@ -5,8 +5,9 @@ import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
-import type { ScheduleCatalogEntry, ScheduleId } from '@deepseek-ai/dsh-schedule/client'
+import type { ScheduleId, ScheduleCatalogEntry } from '@deepseek-ai/dsh-schedule/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { ScheduleCreateCard, type ScheduleCreateCardProps } from '../src/client/ScheduleCreateCard.tsx'
 import { narrowScheduleRecord, scheduleCreateCardModel } from '../src/client/schedule-create-card.ts'
 import { zoneLabel } from '../src/client/schedule-format.ts'
@@ -34,12 +35,22 @@ const cronTask = {
   scheduledAt: '2026-10-01T01:15:00.000Z', expression: '*/15 9-17 * * 1-5', timeZone: 'Asia/Shanghai',
 }
 
+/** A `schedule_create` result as the current tool returns it: the created Host task. */
+const hostTask = { kind: 'rrule',
+  id: 'task-host', title: 'Check the deployment', prompt: PROMPT,
+  rrule: 'DTSTART;TZID=Asia/Shanghai:20261005T090000\nRRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE',
+  scheduledAt: '2026-10-05T01:00:00.000Z', target: { kind: 'session', sessionId: 'session-alpha' },
+  involvedSessionIds: ['session-alpha'], status: 'active', createdAt: '2026-10-01T00:00:00.000Z',
+  updatedAt: '2026-10-01T00:00:00.000Z',
+}
+
 afterEach(cleanup)
 
 /** One running call block carrying the model's own arguments. */
 function running(args: unknown = ARGS): ToolBlock {
   return {
     phase: 'start',
+    args: PartialArguments.fromText(typeof args === 'string' ? args : JSON.stringify(args)),
     callId: CALL, name: TOOL, argsRaw: typeof args === 'string' ? args : JSON.stringify(args),
     turn: 1, step: 1, time: 0, subCalls: [],
   }
@@ -53,12 +64,12 @@ function settled(value: unknown, options: {
   isError?: boolean
   call?: boolean
 } = {}): ToolBlock {
+  const argsRaw = typeof options.args === 'string' ? options.args : JSON.stringify(options.args ?? ARGS)
   return {
     kind: 'tool-result', seq: 1, time: 1, callId: CALL,
-    call: options.call === false ? null : {
-      name: TOOL,
-      argsRaw: typeof options.args === 'string' ? options.args : JSON.stringify(options.args ?? ARGS),
-    },
+    name: options.call === false ? '' : TOOL,
+    args: options.call === false ? PartialArguments.EMPTY : PartialArguments.fromText(argsRaw),
+    call: options.call === false ? null : { name: TOOL, argsRaw },
     callTime: 0,
     content: options.content ?? [{ type: 'text', text: options.text ?? JSON.stringify(value) }],
     isError: options.isError ?? false,
@@ -66,11 +77,13 @@ function settled(value: unknown, options: {
   } as ToolBlock
 }
 
-/** One catalog entry the settled read holds for a narrowed fixture. */
-function catalogEntry(fixture: unknown, status: ScheduleCatalogEntry['status'] = 'active'): ScheduleCatalogEntry {
-  const task = narrowScheduleRecord(fixture)
-  if (task === undefined) throw new Error('fixture must narrow to a rule')
-  return { ...task, sessionId: 'session-alpha' as SessionId, status }
+/** The settled catalog row of the created task after an edit renamed it and moved it to a weekly rule. */
+const changedTask: ScheduleCatalogEntry = { kind: 'rrule',
+  id: dailyTask.id as ScheduleId, title: 'Updated deployment check', prompt: PROMPT,
+  rrule: 'DTSTART;TZID=Asia/Shanghai:20261005T090000\nRRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE',
+  scheduledAt: '2026-10-05T01:00:00.000Z', target: { kind: 'session', sessionId: 'session-alpha' as SessionId },
+  involvedSessionIds: ['session-alpha' as SessionId], status: 'active', createdAt: '2026-10-01T00:00:00.000Z',
+  updatedAt: '2026-10-02T00:00:00.000Z',
 }
 
 /** Component props with an injected open action; the framework fills the rest. */
@@ -94,6 +107,9 @@ describe('narrowScheduleRecord', () => {
     ['a title and instruction whose first line is empty', { ...dailyTask, title: '', prompt: '\nCheck the deployment' }],
     ['no target', { ...dailyTask, scheduledAt: undefined }],
     ['an unknown kind', { ...dailyTask, kind: 'cronx' }],
+    ['RRULE text without its kind', { ...hostTask, kind: undefined }],
+    ['an RRULE without its expression', { ...hostTask, rrule: undefined }],
+    ['an empty RRULE expression', { ...hostTask, rrule: '' }],
     ['an after rule without its delay', { ...dailyTask, kind: 'after' }],
     ['an every rule without its interval', { ...dailyTask, kind: 'every' }],
     ['a daily rule without its time', { id: 'x', kind: 'daily', prompt: PROMPT, scheduledAt: dailyTask.scheduledAt, timeZone: 'UTC' }],
@@ -139,7 +155,7 @@ describe('scheduleCreateCardModel', () => {
 
   it('names a still-preparing call by the tool until its arguments arrive', () => {
     expect(scheduleCreateCardModel({
-      phase: 'preparing', callId: CALL, name: TOOL, turn: 1, step: 1, time: 0, subCalls: [],
+      phase: 'preparing', args: PartialArguments.EMPTY, callId: CALL, name: TOOL, turn: 1, step: 1, time: 0, subCalls: [],
     }, TOOL)).toEqual({ task: undefined, title: TOOL, output: null })
   })
 
@@ -177,6 +193,13 @@ describe('scheduleCreateCardModel', () => {
 
   it('reads no task from a replayed result that is not a complete rule', () => {
     expect(scheduleCreateCardModel(settled({ code: 'invalid_rule', message: 'no' }), TOOL).task).toBeUndefined()
+  })
+
+  it('reads the created Host task with its stored rule', () => {
+    expect(scheduleCreateCardModel(settled(hostTask), TOOL).task).toEqual({ kind: 'rrule',
+      id: hostTask.id, title: hostTask.title, prompt: PROMPT, scheduledAt: hostTask.scheduledAt, rrule: hostTask.rrule,
+    })
+    expect(narrowScheduleRecord(hostTask)).toEqual(scheduleCreateCardModel(settled(hostTask), TOOL).task)
   })
 })
 
@@ -220,6 +243,7 @@ describe('ScheduleCreateCard', () => {
     [{ ...dailyTask, kind: 'every', everySeconds: 300, time: undefined, timeZone: undefined }, 'Every 5 minutes'],
     [dailyTask, `Daily at 23:00 (${zoneLabel('Asia/Shanghai', makeTranslate(en))})`],
     [weeklyTask, `Weekly on Mon, Wed at 09:00 (${zoneLabel('Asia/Shanghai', makeTranslate(en))})`],
+    [hostTask, `Weekly on Mon, Wed at 09:00 (${zoneLabel('Asia/Shanghai', makeTranslate(en))})`],
   ])('formats the frequency line of one created task', (task, frequency) => {
     render(<ScheduleCreateCard {...props(settled(task))} />)
     expect(screen.getByText(frequency)).toBeDefined()
@@ -265,9 +289,8 @@ describe('ScheduleCreateCard', () => {
   })
 
   it('shows the current rule and name of a task that changed', () => {
-    const current = catalogEntry({ ...weeklyTask, id: dailyTask.id, title: 'Updated deployment check' })
     const openTaskDetail = vi.fn()
-    render(<ScheduleCreateCard {...props(settled(dailyTask), openTaskDetail)} currentTask={current} />)
+    render(<ScheduleCreateCard {...props(settled(dailyTask), openTaskDetail)} currentTask={changedTask} />)
     expect(screen.getByText('Updated deployment check')).toBeDefined()
     expect(screen.getByText(`Weekly on Mon, Wed at 09:00 (${zoneLabel('Asia/Shanghai', makeTranslate(en))})`))
       .toBeDefined()
@@ -282,11 +305,9 @@ describe('ScheduleCreateCard', () => {
     expect(frequency).toMatch(/color:\s*var\(--dsw-alias-label-tertiary\);/)
     expect(frequency).toMatch(/font-size:\s*10px;/)
     expect(frequency).toMatch(/line-height:\s*16px;/)
-    // The box is the delivery card's (ui-deliverables `.file`): fill/hover pair,
-    // 8/10 padding, 18px corner, and a 60px row (8px insets around 44px).
     const card = /\.card\s*\{([^}]*)\}/.exec(stylesheet)?.[1] ?? ''
     expect(card).toMatch(/padding:\s*8px 10px;/)
-    expect(card).toMatch(/border-radius:\s*18px;/)
+    expect(card).toMatch(/border-radius:\s*var\(--dsw-radius-lg\);/)
     expect(card).toMatch(/background:\s*var\(--card-fill\);/)
     expect(stylesheet).toMatch(/\.card:has\(\.cardOpen\):hover\s*\{[^}]*background:\s*var\(--card-hover\);/)
     expect(stylesheet).toMatch(/\.row\s*\{[^}]*min-height:\s*44px;/)

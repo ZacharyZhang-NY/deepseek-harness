@@ -9,6 +9,7 @@ import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import { CHAT_SEARCH_MAX_LINES, searchCardModel } from '../src/client/tool/models/search-card-model.ts'
 import { zh } from '@deepseek-ai/dsh-client-ui-conversation/src/client/locales.ts'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { GenericToolCard, type GenericToolCardProps } from '../src/client/tool/toolviews/GenericToolCard.tsx'
 import { SearchRow, searchToolview } from '../src/client/tool/toolviews/search-row.tsx'
 
@@ -62,26 +63,37 @@ const pathsMeta = (over?: Partial<PathsMeta>): PathsMeta => ({
   shape: 'paths', paths: ['src/a.ts', 'src/b.ts'], truncated: false, total: 2, ...over,
 })
 
-const runningGrep = (over?: Partial<StartedToolCall>): StartedToolCall => ({
-  phase: 'start' as const, callId: 'c1', name: 'grep', argsRaw: GREP_ARGS,
-  turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
-})
+const runningGrep = (over?: Partial<StartedToolCall>): StartedToolCall => {
+  const argsRaw = over?.argsRaw ?? GREP_ARGS
+  return {
+    phase: 'start' as const, args: PartialArguments.fromText(argsRaw), callId: 'c1', name: 'grep', argsRaw,
+    turn: 1, step: 1, time: 1_000, subCalls: [], ...over,
+  }
+}
 
-const settledGrep = (over?: Partial<ToolResultNode>): ToolResultNode => ({
-  kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
-  call: { name: 'grep', argsRaw: GREP_ARGS },
-  callTime: 1_000,
-  content: [{ type: 'text', text: 'a.ts\n  Line 12: const foo = 1' }], isError: false,
-  meta: matchesMeta(), subCalls: [], ...over,
-})
+const settledGrep = (over?: Partial<ToolResultNode>): ToolResultNode => {
+  const call = over?.call === undefined ? { name: 'grep', argsRaw: GREP_ARGS } : over.call
+  return {
+    kind: 'tool-result', seq: 10, time: 2_000, callId: 'c1',
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
+    callTime: 1_000,
+    content: [{ type: 'text', text: 'a.ts\n  Line 12: const foo = 1' }], isError: false,
+    meta: matchesMeta(), subCalls: [], ...over,
+  }
+}
 
-const settledGlob = (over?: Partial<ToolResultNode>): ToolResultNode => ({
-  kind: 'tool-result', seq: 11, time: 2_000, callId: 'c2',
-  call: { name: 'glob', argsRaw: GLOB_ARGS },
-  callTime: 1_000,
-  content: [{ type: 'text', text: 'src/a.ts\nsrc/b.ts' }], isError: false,
-  meta: pathsMeta(), subCalls: [], ...over,
-})
+const settledGlob = (over?: Partial<ToolResultNode>): ToolResultNode => {
+  const call = over?.call === undefined ? { name: 'glob', argsRaw: GLOB_ARGS } : over.call
+  return {
+    kind: 'tool-result', seq: 11, time: 2_000, callId: 'c2',
+    name: call?.name ?? '', args: call === null ? PartialArguments.EMPTY : PartialArguments.fromText(call.argsRaw),
+    call,
+    callTime: 1_000,
+    content: [{ type: 'text', text: 'src/a.ts\nsrc/b.ts' }], isError: false,
+    meta: pathsMeta(), subCalls: [], ...over,
+  }
+}
 
 describe('searchCardModel', () => {
   it('derives a matches card from grep result metadata', () => {
@@ -97,6 +109,21 @@ describe('searchCardModel', () => {
       },
     })
   })
+
+  it('keeps the matches card when the recorded include is empty', () => {
+    const call = { name: 'grep', argsRaw: '{"pattern":"foo","path":"src","include":""}' }
+    expect(searchCardModel(settledGrep({ call }))).toEqual(searchCardModel(settledGrep()))
+    expect(searchCardModel(settledGrep({ call, isError: true }))).toBeNull()
+  })
+
+  it.each([null, false, 7, [], {}, ' ', '\t\n', '!*.ts', '*.ts,*.md'])(
+    'keeps invalid include %j on the generic path',
+    (include) => {
+      expect(searchCardModel(settledGrep({
+        call: { name: 'grep', argsRaw: JSON.stringify({ pattern: 'foo', include }) },
+      }))).toBeNull()
+    },
+  )
 
   it('derives a paths card from glob result metadata, carrying the truncation signal', () => {
     // Empty block content isolates the truncation signal from the recovery arm.
@@ -176,6 +203,7 @@ describe('searchCardModel', () => {
 
 describe('chat row search body (GenericToolCard fallback)', () => {
   const ownerProps = (block: StartedToolCall | ToolResultNode, toolName: string): GenericToolCardProps => ({
+    getFileTriggerProps: () => ({}),
     loadImage: vi.fn(() => Promise.reject(new Error('not used'))),
     useDisclosure, callId: 'c1', toolName, ...('kind' in block ? { phase: 'result' as const, block: block } : { phase: block.phase, block: block }), openFile: vi.fn(), t,
   })
@@ -184,9 +212,12 @@ describe('chat row search body (GenericToolCard fallback)', () => {
     fireEvent.click(view.container.querySelector('[data-expandable]')!)
   }
 
-  it('the expanded body is the grouped matches, capped tighter than the panel', () => {
+  it.each([undefined, ''])('the expanded body groups matches when include is %j', (include) => {
     expect(CHAT_SEARCH_MAX_LINES).toBeLessThan(16)
-    const view = render(<GenericToolCard {...ownerProps(settledGrep(), 'grep')} />)
+    const block = settledGrep({
+      call: { name: 'grep', argsRaw: JSON.stringify({ pattern: 'foo', path: 'src', ...include === undefined ? {} : { include } }) },
+    })
+    const view = render(<GenericToolCard {...ownerProps(block, 'grep')} />)
     // Collapsed: the one-line summary row only, no card.
     expect(view.queryByText(/const foo = 1/)).toBeNull()
     toggleRow(view)

@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * ui-deliverables browser half: the derivation contract of produced paths,
  * recorded changes, and deliveries over engine-published Turn data, the
@@ -43,7 +44,10 @@ function openProps(controller = new PresentedOpenController(), summaries = new C
   controller.host.set({ name: 'desktop', available: true, fileManager: 'finder' })
   const diffs = new ChangesDiffStore()
   const sessions: SessionListState = { ids: [], byId: {}, phase: 'ready', projectionsBySession: {} }
+  const openMenu = vi.fn()
   return {
+    openMenu,
+    useContextMenu: contextMenuHook(openMenu),
     SessionProvider: ({ children }: { children?: import('react').ReactNode }) => <>{children}</>,
     renderSlot: renderFileActions,
     useChangesDiff: <T,>(select: (state: ReturnType<typeof diffs.state.getSnapshot>) => T): T => select(diffs.state.getSnapshot()),
@@ -105,8 +109,8 @@ const turnLocation = (turn: number, deliverables?: DeliverablesTurnData): TurnLo
   return { turn, start: undefined, end: undefined, status: 'closed', steps: [], data }
 }
 
-const produced = (...values: ReadonlyArray<readonly [seq: number, path: string]>): DeliverablesTurnData => ({
-  produced: values.map(([seq, path]) => ({ seq, path })),
+const produced = (...paths: readonly string[]): DeliverablesTurnData => ({
+  produced: paths.map(path => ({ path })),
 })
 
 function tailOwner(
@@ -187,8 +191,9 @@ function rawCall(
   )
 }
 
-function result(seq: number, callId: string, isError = false, turn = 1): SessionLiveEventEntry {
+function result(seq: number, callId: string, isError = false, turn = 1, meta?: unknown): SessionLiveEventEntry {
   return at(seq, 'tool/result', {
+    ...meta === undefined ? {} : { meta },
     turn,
     step: 1,
     message: {
@@ -215,17 +220,86 @@ function deliverablesOf(value: ConversationNodeAssembler, turn = 1): Readonly<De
 }
 
 describe('produced-file Turn data', () => {
-  it('deduplicates paths in first-seen order and stops at the closing Assistant seq', () => {
-    const data = produced(
-      [3, 'out/index.html'],
-      [4, 'out/app.css'],
-      [4, 'out/index.html'],
-      [8, 'after.txt'],
-    )
-    expect(producedForClosing(data, 6)).toEqual(['out/index.html', 'out/app.css'])
-    expect(selectProducedFiles(tailOwner(data, 6))).toEqual(['out/index.html', 'out/app.css'])
+  it('deduplicates paths in first-seen order across the whole turn', () => {
+    const data = produced('out/index.html', 'out/app.css', 'out/index.html', 'after.txt')
+    expect(producedForClosing(data)).toEqual(['out/index.html', 'out/app.css', 'after.txt'])
+    expect(selectProducedFiles(tailOwner(data, 6))).toEqual(['out/index.html', 'out/app.css', 'after.txt'])
     expect(producedForClosing(undefined)).toEqual([])
     expect(selectProducedFiles(tailOwner(undefined, 9, () => {}, 2))).toBeNull()
+  })
+
+  it('includes mutations that settle after the closing reply', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      call(3, 'late', 'write', { file_path: 'late.txt', content: 'late' }),
+      result(4, 'late', false, 1, { path: '/project/late.txt' }),
+      at(5, 'turn/end', { turn: 1 }),
+    ])
+    const data = deliverablesOf(value)
+    // The closing reply at seq 2 shares the step that called write, and no later step wrote text.
+    expect(selectProducedFiles(tailOwner(data, 2))).toEqual(['/project/late.txt'])
+    const opened = vi.fn()
+    producedFileMentions(['/project/late.txt'], opened, path => path, data?.produced).resolve('late.txt')?.open()
+    expect(opened).toHaveBeenCalledWith('/project/late.txt')
+  })
+
+  it('opens a moved write at its recorded target when an absolute delivery names the same file', () => {
+    const path = '/project/child/report.txt'
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      call(2, 'write', 'write', { file_path: 'report.txt', content: 'CHILD FILE' }),
+      result(3, 'write', false, 1, { path, diffs: [] }),
+      at(4, 'deliverables/presented', { turn: 1, callId: 'present', files: [{ path }] }),
+    ])
+    const data = deliverablesOf(value)
+    const paths = producedForClosing(data)
+    expect(paths).toEqual([path])
+    const delivered = presentedForClosing(tailOwner(data, 5))
+    const opened = vi.fn()
+    const mentions = producedFileMentions([...new Set([...paths, ...delivered.map(file => file.path)])], opened, target => target)
+    mentions.resolve('report.txt')?.open()
+    expect(opened).toHaveBeenCalledWith(path)
+    expect(mentions.resolve('report.txt')?.title).toBe(path)
+  })
+
+  it('deduplicates canonical mutation targets and keeps same-basename files distinct', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      call(2, 'first', 'write', { file_path: 'report.txt', content: 'first' }),
+      result(3, 'first', false, 1, { path: '/project/a/report.txt' }),
+      call(4, 'alias', 'edit', { file_path: './report.txt', old_string: 'first', new_string: 'updated' }),
+      result(5, 'alias', false, 1, { path: '/project/a/report.txt' }),
+      call(6, 'second', 'write', { file_path: 'report.txt', content: 'second' }),
+      result(7, 'second', false, 1, { path: '/project/b/report.txt' }),
+    ])
+    const paths = producedForClosing(deliverablesOf(value))
+    expect(paths).toEqual(['/project/a/report.txt', '/project/b/report.txt'])
+    const mentions = producedFileMentions(paths, () => {}, target => target)
+    expect(mentions.resolve('report.txt')).toBeUndefined()
+    expect(mentions.resolve('/project/b/report.txt')?.title).toBe('/project/b/report.txt')
+  })
+
+  it.each([{ path: 'unknown/report.txt' }, { path: null }, { path: 42 }])('keeps a relative target inert when its recorded path is invalid: %j', (meta) => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      call(2, 'unknown', 'write', { file_path: 'report.txt', content: 'new' }),
+      result(3, 'unknown', false, 1, meta),
+    ])
+    expect(producedForClosing(deliverablesOf(value))).toEqual([])
+  })
+
+  it('opens an explicit absolute mutation target when its recorded path is unusable', () => {
+    const path = '/project/child/report.txt'
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      call(2, 'absolute', 'write', { file_path: path, content: 'new' }),
+      result(3, 'absolute', false, 1, { path: null }),
+    ])
+    const paths = producedForClosing(deliverablesOf(value))
+    expect(paths).toEqual([path])
+    const opened = vi.fn()
+    producedFileMentions(paths, opened, target => target).resolve('report.txt')?.open()
+    expect(opened).toHaveBeenCalledWith(path)
   })
 
   it('folds successful first-party mutation paths from their raw arguments', () => {
@@ -501,7 +575,7 @@ describe('ChangedFiles card', () => {
     controller = new PresentedOpenController(), locale = en, matched = { changes, presented: [] as never[] }, summaries = servedStore(),
   ) {
     const props = openProps(controller, summaries)
-    props.openChanged.mockResolvedValue(null)
+    props.openChanged.mockResolvedValue({ kind: 'opened' })
     const openFile = vi.fn<(path: string) => void>()
     const view = render(<Deliverables {...props} matched={matched} openFile={openFile} sessionId={SessionId('child-session')} t={makeTranslate(locale)} />)
     return { props, openFile, view }
@@ -714,6 +788,32 @@ describe('ChangedFiles card', () => {
 describe('producedFileMentions resolver', () => {
   const label = (path: string) => `打开 ${path}`
 
+  it('does not let a legacy bare path override an ambiguous canonical basename', () => {
+    const resolver = producedFileMentions(['report.txt', '/project/child/report.txt'], () => {}, label)
+    expect(resolver.resolve('report.txt')).toBeUndefined()
+    expect(resolver.resolve('/project/child/report.txt')?.title).toBe('/project/child/report.txt')
+  })
+
+  it('maps only uniquely recorded argument aliases to their canonical targets', () => {
+    const first = '/project/one/out/report.txt'
+    const second = '/project/two/out/report.txt'
+    const opened = vi.fn()
+    const unique = producedFileMentions([first], opened, label, [
+      { path: first, argumentPath: 'out/report.txt' },
+      { path: first, argumentPath: './out/report.txt' },
+    ])
+    unique.resolve('out/report.txt')?.open()
+    expect(opened).toHaveBeenCalledWith(first)
+    expect(unique.resolve('./out/report.txt')?.title).toBe(first)
+    expect(unique.resolve('one/out/report.txt')).toBeUndefined()
+    const ambiguous = producedFileMentions([first, second], opened, label, [
+      { path: first, argumentPath: 'out/report.txt' },
+      { path: second, argumentPath: 'out/report.txt' },
+    ])
+    expect(ambiguous.resolve('out/report.txt')).toBeUndefined()
+    expect(ambiguous.resolve('report.txt')).toBeUndefined()
+  })
+
   it('resolves exact paths and unique basenames; ambiguity and unknowns stay unresolved', () => {
     const opened: string[] = []
     const resolver = producedFileMentions(
@@ -742,6 +842,7 @@ describe('producedFileMentions resolver', () => {
 describe('plugin registration', () => {
   it('registers the tail entry and fiber disposal removes it', async () => {
     const ctx = new Context()
+    ctx.provide('contextMenus', { register: () => () => {}, open: vi.fn() } as never)
     await ctx.plugin(SlotRegistry).await()
     new UiConversation(ctx, { binding: () => undefined } as never)
     // The owning view's child declaration, stood up by a bench root entry.
@@ -785,7 +886,7 @@ describe('plugin registration', () => {
     // resolver whose matches open through the owner-supplied opener.
     const opened: string[] = []
     const owner = tailOwner(
-      produced([2, 'site/report.html']),
+      produced('site/report.html'),
       3,
       (path) => { opened.push(path) },
     )
@@ -794,15 +895,32 @@ describe('plugin registration', () => {
     expect(mentions?.resolve('report.html')?.label).toBe('Open site/report.html in sidebar')
     mentions?.resolve('report.html')?.open()
     expect(opened).toEqual(['site/report.html'])
+    const canonical = '/project/child/out/report.txt'
+    const moved = tailOwner({ produced: [{ path: canonical, argumentPath: 'out/report.txt' }] }, 3, previewPath => opened.push(previewPath))
+    const movedMentions = service?.forClosing(moved, SessionId('moved-session'))
+    movedMentions?.resolve('out/report.txt')?.open()
+    expect(opened.at(-1)).toBe(canonical)
+    expect(movedMentions?.resolve('out/report.txt')?.title).toBe(canonical)
+    // A delivery recorded after the closing reply still resolves in that reply's prose.
+    const late = tailOwner({ produced: [], presented: [{ path: 'out/late.docx', seq: 5, index: 0 }] }, 3, previewPath => opened.push(previewPath))
+    service?.forClosing(late, SessionId('late-session'))?.resolve('late.docx')?.open()
+    expect(opened.at(-1)).toBe('out/late.docx')
+
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
     vi.stubGlobal('fetch', fetcher)
     const preview = vi.fn<(path: string) => void>()
-    for (const produced of [[], [{ path: 'out/report.docx', seq: 1 }]]) {
+    for (const produced of [[], [{ path: 'out/report.docx' }]]) {
       const delivered = tailOwner({ produced, presented: [{ path: 'out/report.docx', seq: 2, index: 0 }] }, 3, preview)
-      const mentions = service?.forClosing(delivered, SessionId('child-session'))
+      const { getTriggerProps } = contextMenuHook((target, point) => { ctx.contextMenus.open(target, point) })()
+      const mentions = service?.forClosing(delivered, SessionId('child-session'), path =>
+        getTriggerProps({ kind: 'file', value: { sessionId: SessionId('child-session'), path } }))
       for (const text of ['report.docx', 'out/report.docx']) {
         const mention = mentions?.resolve(text)
         expect(mention?.label).toBe('Open out/report.docx in sidebar')
+        const trigger = render(<button {...mention?.contextMenuProps}>Mention</button>)
+        fireEvent.contextMenu(trigger.getByRole('button'), { clientX: 41, clientY: 52 })
+        trigger.unmount()
+        expect(vi.spyOn(ctx.contextMenus, 'open')).toHaveBeenLastCalledWith({ kind: 'file', value: { sessionId: 'child-session', path: 'out/report.docx' } }, { x: 41, y: 52 })
         mention?.open()
       }
     }
@@ -820,9 +938,9 @@ describe('plugin registration', () => {
     // The replaced connection may reach a Host that no longer serves the summaries read so far.
     expect(face.hooks.changesSummary.getSnapshot()).toEqual({})
     await face.openPresented(SessionId('child-session'), 2, 0)
-    expect(face.hooks.presentedOpen.getSnapshot()['api/present.open?sessionId=child-session&seq=2&index=0']).toBe('opened')
+    expect(face.hooks.presentedOpen.getSnapshot()['api/present.open?sessionId=child-session&seq=2&index=0']).toBeUndefined()
     await face.openChanged(SessionId('child-session'), 5, 0)
-    expect(face.hooks.presentedOpen.getSnapshot()['api/changes.open?sessionId=child-session&seq=5&index=0']).toBe('opened')
+    expect(face.hooks.presentedOpen.getSnapshot()['api/changes.open?sessionId=child-session&seq=5&index=0']).toBeUndefined()
     face.openChangesReview({ sessionId: SessionId('child-session'), seq: 5, turn: 3 }, 1)
     expect(openResource).toHaveBeenCalledWith('dsh-resource://changes-review/session/child-session/5/3', { params: { index: 1 } })
     expect((registered as { title(address: string): string }).title('dsh-resource://changes-review/session/child-session/5/3')).toBe('Review · turn 3')
@@ -843,7 +961,7 @@ describe('plugin registration', () => {
     await tabFace.reloadPresentedHost()
     fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }))
     await tabFace.openChanged(SessionId('child-session'), 5, 1)
-    expect(tabFace.hooks.presentedOpen.getSnapshot()['api/changes.open?sessionId=child-session&seq=5&index=1']).toBe('opened')
+    expect(tabFace.hooks.presentedOpen.getSnapshot()['api/changes.open?sessionId=child-session&seq=5&index=1']).toBeUndefined()
     ctx.emit('connection/reset')
     expect(tabFace.hooks.changesDiff.getSnapshot()).toEqual({})
     // A turn that produced nothing yields no vocabulary at all.
@@ -873,16 +991,27 @@ describe('presented files', () => {
   it('replays deliveries without mutation calls, preserves indices, and isolates turns', () => {
     const value = assembler([
       at(1, 'turn/start', { turn: 1 }),
-      at(2, 'deliverables/presented', { turn: 1, callId: 'nested', files: [null, { ...file(), description: 'Final report' }] }),
+      at(2, 'deliverables/presented', { turn: 1, callId: 'nested', files: [null, { ...file(), description: 'Final report' }, file('notes.md')] }),
       at(3, 'deliverables/presented', { turn: 1, callId: 'again', files: [{ ...file(), description: 'Updated report' }] }),
       at(4, 'turn/end', { turn: 1 }),
       at(5, 'turn/start', { turn: 2 }),
     ])
-    const first = presentedForClosing(tailOwner(deliverablesOf(value), 3))
-    expect(first).toMatchObject([{ path: 'report.docx', seq: 2, index: 1, description: 'Final report' }])
-    expect(presentedForClosing(tailOwner(deliverablesOf(value), 4)))
-      .toMatchObject([{ path: 'report.docx', seq: 3, description: 'Updated report' }])
+    expect(presentedForClosing(tailOwner(deliverablesOf(value), 4))).toMatchObject([
+      { path: 'report.docx', seq: 3, index: 0, description: 'Updated report' },
+      { path: 'notes.md', seq: 2, index: 2 },
+    ])
     expect(selectDeliverables(tailOwner(deliverablesOf(value, 2), 9))).toBeNull()
+  })
+
+  it('keeps deliveries recorded after the closing reply', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }),
+      at(3, 'deliverables/presented', { turn: 1, callId: 'present', files: [{ ...file(), description: 'Final report' }] }),
+      at(4, 'turn/end', { turn: 1 }),
+    ])
+    // The closing reply at seq 2 shares the step that called present, and no later step wrote text.
+    expect(selectDeliverables(tailOwner(deliverablesOf(value), 2))?.presented)
+      .toMatchObject([{ path: 'report.docx', seq: 3, index: 0, description: 'Final report' }])
   })
 
   it('uses the viewed fork Session in every open action and expands all delivered files', () => {
@@ -894,8 +1023,10 @@ describe('presented files', () => {
     const owner = tailOwner(deliverablesOf(value), 3, preview)
     const matched = selectDeliverables(owner)!
     const props = openProps()
-    props.openPresented.mockResolvedValue(null)
+    props.openPresented.mockResolvedValue({ kind: 'opened' })
     const view = render(<Deliverables {...props} matched={matched} openFile={owner.openFile} sessionId={SessionId('child-session')} t={makeTranslate(en)} />)
+    fireEvent.contextMenu(view.getByRole('button', { name: 'Preview report-0.docx in sidebar' }), { clientX: 18, clientY: 29 })
+    expect(props.openMenu).toHaveBeenCalledWith({ kind: 'file', value: { sessionId: 'child-session', path: 'report-0.docx' } }, { x: 18, y: 29 })
     expect(view.container.querySelectorAll('[data-presented-file]')).toHaveLength(4)
     const expand = view.getByRole('button', { name: 'Show all 8 delivered files' })
     expect(expand.getAttribute('aria-expanded')).toBe('false')
@@ -973,7 +1104,7 @@ it('lets one delivered file span the complete row without an expansion control',
 })
 
 
-it.each(['opening', 'opened', 'error'] as const)('shows the %s state and permits retries after failure', (phase) => {
+it.each(['opening', 'error'] as const)('shows the %s state and permits retries after failure', (phase) => {
   const controller = new PresentedOpenController()
   controller.state.set({ 'api/present.open?sessionId=session&seq=2&index=0': phase })
   const props = openProps(controller)

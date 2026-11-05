@@ -4,6 +4,7 @@ import { FiberState } from '@deepseek-ai/cordis'
 import type { Context, Plugin, RegistryService } from '@deepseek-ai/cordis'
 import type { ClientModuleLoader, ClientModuleLoaderTarget } from '@deepseek-ai/dsh-client-modules/client'
 import { chromium } from 'playwright'
+import { hasExperimentalPackageReference } from '../../../scripts/experimental-package-policy.ts'
 import { expect, it } from 'vitest'
 import { withDefaultWeb } from '../../cli/tests/profiles/web/tests/default-web-process.ts'
 import { newEnglishPage } from './support.ts'
@@ -44,7 +45,7 @@ function experimentalClientReferences(roster: Awaited<ReturnType<typeof readClie
     ...roster.entries.map(entry => entry.name),
     ...roster.plugins.flatMap(plugin => [plugin.owner ?? '', ...plugin.modules]),
     ...roster.modules,
-  ].filter(name => name.startsWith('@deepseek-ai/dsh-experimental-'))
+  ].filter(hasExperimentalPackageReference)
 }
 
 it('activates the actual default Client registry without experimental packages', async (test) => {
@@ -93,7 +94,7 @@ it('activates the actual default Client registry without experimental packages',
       expect(roster.plugins.some(plugin => plugin.modules.includes('@deepseek-ai/dsh-client-ui-layout'))).toBe(true)
       expect(experimentalClientReferences(roster)).toEqual([])
       const contaminatedHost = await request('mount-experimental-entry')
-      const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+      const experimentalName = '@deepseek-ai/dsh-experimental-client-ui-voice-input'
       expect(contaminatedHost.client.entries.map(entry => entry.id)).toContain(experimentalName)
       await page.reload()
       await expect.poll(async () => {

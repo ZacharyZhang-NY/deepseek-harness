@@ -41,6 +41,8 @@ kind: "package-reference"
 
 对话框是 680×500 的 Miller 分栏视图（在较矮或较窄的视口中限制尺寸），经 `ctx.workspaces` 驱动宿主的 `listDirectory` 与 `createDirectory` 原语。两处注册经嵌套的 `ctx.slots.inject()` 调用作为一次事务性效果安装，因为任一声明条目都可能晚些激活或替换其声明；对话框文案注册在本包自己的 locale 命名空间下，让两份字典作为一个单元落地。浏览类失败留在对话框自己的提示区内，因此本填充从不驱动持有方的 `onError` 分支。node 半部是一个空 `apply`，让插件留在宿主名单上。
 
+New folder 和 Cancel 操作使用共享 [Button](../ui-primitives/README.zh.md) 的内侧细描边，保留布局边框，并使小数宽度的按钮保持完整描边。
+
 </details>
 
 -----
@@ -53,7 +55,7 @@ kind: "package-reference"
 - [dsh-host-directory-picker-browse](../../host/directory-picker-browse/README.zh.md)——本表面驱动的目录列出后端。
 - [ui-workspace](../ui-workspace/README.zh.md)——声明目录流程槽位并拥有拾取对话。
 - [ui-directory-picker-native](../ui-directory-picker-native/README.zh.md)——面向本地部署的原生操作系统选择器替代方案。
-- [Web 客户端架构](../../../.agents/notes/implemented/architecture/2026-07-19-gui-web-client-architecture.zh.md)——浏览器插件行如何加载并注册槽位。
+- [Web 客户端架构](../../../docs/subsystems/web-client.zh.md)——浏览器插件行如何加载并注册槽位。
 
 -----
 
@@ -85,5 +87,3 @@ kind: "package-reference"
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。插件只注册一个工作区目录流程持有方，其资源释放由 HMR（热模块替换）安全规范验证；它显示的每个目录列表都会按需从 Host 重新读取，而不会保存在本包中。

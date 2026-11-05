@@ -1,3 +1,4 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 // Web e2e scenario: fresh round trip. A real chromium types a prompt into the
 // real composer; the wire, Remote gateway, agent loop, and the REAL bash tool (echo
 // in the temp workspace) all run; the model adapter is dsh-llm-replay (keyless)
@@ -6,7 +7,7 @@
 // record cannot hang on a live model answering differently); assertion steps
 // run in replay/refresh only. Streaming fidelity is asserted from the durable
 // embedded Assistant stream, not transient DOM.
-// Record: DSH_SNAPSHOT=record writes session.v3.jsonl, then a keyless
+// Record: DSH_SNAPSHOT=record writes the current Session generation, then a keyless
 // DSH_SNAPSHOT=refresh regenerates ui.expected.md.
 // Suite setup (beforeAll, not per step): one fixed page clock
 // (page.clock.setFixedTime) and one routed Remote mux socket
@@ -19,7 +20,7 @@ import type { Browser, Page, Route, WebSocketRoute } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { ToolCallId, expandAssistantStream } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionListValue } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import {
@@ -130,7 +131,7 @@ describe('web e2e: fresh round trip through the real assembly', () => {
             key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
           }))
           // sendSession registered its paint yield first. This frame observes the
-          // committed echo while admission remains queued on the following task.
+          // composer holding the message while the Host has not accepted it yet.
           await new Promise<void>((resolve) => { requestAnimationFrame(() => { resolve() }) })
           const echo = document.querySelector<HTMLElement>('[data-submission-echo]')
           return [
@@ -144,6 +145,10 @@ describe('web e2e: fresh round trip through the real assembly', () => {
       expect(await response.json()).toMatchObject({ result: { ok: true, value: { accepted: true } } })
       accepted = true
       await compareOrRefreshGolden(ECHO_EXPECTED, echoSnapshot, MODE)
+      // Acceptance publishes the echo and clears the composer; maintenance keeps the Turn from starting.
+      await page.locator('[data-submission-echo]', { hasText: PROMPT }).waitFor()
+      await expect.poll(() => input.textContent()).toBe('')
+      expect(await input.getAttribute('contenteditable')).toBe('true')
       const row = page.getByRole('tree', { name: 'Sessions', exact: true })
         .locator('[role="treeitem"][aria-selected="true"]')
       await expect.poll(() => row.getAttribute('draggable'), { timeout: 5_000 }).toBe('true')
@@ -213,7 +218,7 @@ describe('web e2e: fresh round trip through the real assembly', () => {
     }
   }, 200_000)
 
-  it('ends the system prompt with the source checkout, Web surface, and session cwd', async () => {
+  it('keeps value-free Web guidance in the system prompt and process values in runtime context', async () => {
     if (settledSessionId === undefined) throw new Error('the drive turn did not publish a session id')
     const agent = scaffold.ctx.agents.get(settledSessionId)
     if (agent === undefined) throw new Error(`the settled Web agent ${settledSessionId} is no longer live`)
@@ -224,7 +229,15 @@ describe('web e2e: fresh round trip through the real assembly', () => {
       'You are an AI agent powered by DeepSeek Harness.',
       'You are a coding agent powered by the deepseek-v4-flash model.',
     ])
-    const suffix = paragraphs.slice(-3).join('\n\n')
+    const cwd = agent.session.header.cwd
+    if (cwd === undefined) throw new Error('the Web session has no working directory')
+    expect(system).not.toContain(cwd)
+    const userText = agent.session.deriveMessages().filter(message => message.role === 'user')
+      .flatMap(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []))
+    expect(userText.some(text => text.includes(`Current working directory: ${JSON.stringify(cwd)}.`))).toBe(true)
+    expect(system).not.toContain(scaffold.baseUrl)
+    expect(userText.some(text => text.includes(`Current DeepSeek Harness Web GUI URL: ${JSON.stringify(scaffold.baseUrl)}.`))).toBe(true)
+    const suffix = paragraphs.slice(-2).join('\n\n')
       .split(REPO_ROOT).join('{{sourceRoot}}')
       .split(join(scaffold.workspaceCwd, 'workspace')).join('{{cwd}}')
       .split(scaffold.baseUrl).join('{{webUrl}}')
@@ -232,22 +245,34 @@ describe('web e2e: fresh round trip through the real assembly', () => {
   })
 
   it('exposes the assembled Web URL to the real bash tool', async () => {
-    if (settledSessionId === undefined) throw new Error('the drive turn did not publish a session id')
-    const agent = scaffold.ctx.agents.get(settledSessionId)
-    if (agent === undefined) throw new Error(`the settled Web agent ${settledSessionId} is no longer live`)
-    const result = await scaffold.ctx.tools.execute({
-      signal: AbortSignal.timeout(5_000),
-      callId: ToolCallId('web-url-probe'),
-      name: 'bash',
-      arguments: {
-        command: 'printf \'%s\\n\' "$DSH_WEB_URL"',
-        description: 'Print current Web runtime',
-      },
-      agent,
-    })
-    expect(result.isError).toBe(false)
-    expect(result.content.filter(block => block.type === 'text').map(block => block.text).join(''))
-      .toBe(`${scaffold.baseUrl}\n`)
+    // This host probe records job events too; keep it out of the shared
+    // conversation fixture that other browser scenarios replay.
+    const probe = await launchWebScaffold()
+    try {
+      const handle = await probe.ctx.agents.create({
+        sessionId: SessionId('web-url-probe'),
+        setup: agentCtx => probe.ctx.agentPresets.mount(agentCtx).then(() => undefined),
+      })
+      try {
+        const result = await executeToolFixture(probe.ctx, {
+          signal: AbortSignal.timeout(5_000),
+          callId: ToolCallId('web-url-probe'),
+          name: 'bash',
+          arguments: {
+            command: 'printf \'%s\\n\' "$DSH_WEB_URL"',
+            description: 'Print current Web runtime',
+          },
+          agent: handle.agent,
+        })
+        expect(result.isError).toBe(false)
+        expect(result.content.filter(block => block.type === 'text').map(block => block.text).join(''))
+          .toBe(`${probe.baseUrl}\n`)
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await probe.close()
+    }
   })
 
   it.skipIf(MODE === 'record')('rendered the settled turn: markdown, tool row, composer restore', async () => {
